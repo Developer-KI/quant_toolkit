@@ -2,7 +2,6 @@
 utils/ — Shared utilities.
 
   plotting.py              Equity curve, trade, and performance chart helpers
-  sentiment_preprocess.py  Text cleaning and tokenisation for sentiment data
-  sentiment_score.py       Scoring models (VADER, transformer-based) for sentiment text
+  sentiment.py             End-to-end sentiment pipeline: merge scrapers → clean → StanceBERTa score
   http.py                  Lightweight GET/POST HTTP client wrapper (DataFetcher)
 """
