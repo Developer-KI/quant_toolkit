@@ -20,6 +20,7 @@ from .stress import (
     MonteCarloStress,
 )
 
+
 __all__ = [
     # Core
     "Backtester", "BacktestResult",

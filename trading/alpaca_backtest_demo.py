@@ -8,6 +8,14 @@ from core.universe import Universe
 from backtester.engine import Backtester
 from backtester.costs import CompositeCostModel, default_cost_stack
 from backtester.stress import MonteCarloStress, RegimeStressTest
+from hypothesis import (
+    HypothesisTests,
+    PermutationTest,
+    BootstrapCI,
+    WalkForwardAnalysis,
+    DeflatedSharpeRatio,
+    report as hypothesis_report,
+)
 from strategy.built_in import CompositeStrategy, SingleAssetStrategy
 from strategy.indicators import bollinger, ema, rsi
 from strategy.sizing import FixedNotionalSizer, VolatilityTargetSizer
@@ -287,7 +295,7 @@ class BuyAndHoldStrategy(SingleAssetStrategy):
 def demo(
     symbol: str = "SPY",
     start: str = "2010-01-01",
-    end: str = "2026-06-01",
+    end: str = "2020-01-01",
     timeframe: str = "1d",
 ):
     creds = load_credentials()
@@ -301,7 +309,7 @@ def demo(
     config = BacktestConfig(
         initial_capital=100_000.0,
         max_position_pct=1.0,
-        leverage=2.0,
+        leverage=1.0,
     )
 
     cost_model = CompositeCostModel(default_cost_stack())
@@ -400,6 +408,86 @@ def demo(
             f" {m['95th_pctl_return']:>11.2f}"
             f" {m['median_max_dd']:>11.2f}"
         )
+
+    # ── Hypothesis test battery ───────────────────────────────────────────
+    print("\n\n=== Hypothesis Tests (Composite) ===")
+    tests = HypothesisTests.run_all(comp)
+    print(hypothesis_report(tests))
+
+    # ── Strategy comparison: composite vs buy-and-hold ────────────────────
+    print("\n=== Strategy Comparison: Composite vs Buy & Hold ===")
+    for metric in ("sharpe_ratio", "total_return_pct"):
+        t = HypothesisTests.compare(comp, bah, metric=metric)
+        verdict = "✓ Composite wins" if t.reject_null else "✗ No significant edge"
+        print(f"  {metric:<22} p={t.p_value:.4f}  {verdict}")
+
+    # ── Permutation test: is EMA/RSI edge real or random trade order? ──────
+    print("\n=== Permutation Test: EMA/RSI (sharpe_ratio, 2000 permutations) ===")
+    pt = PermutationTest(metric="sharpe_ratio", n_permutations=2_000)
+    pt_result = pt.run(result)
+    print(f"  Observed SR={pt_result.statistic:.3f}  "
+          f"null median={pt_result.meta['null_mean']:.3f}  "
+          f"p={pt_result.p_value:.4f}  "
+          f"{'✓ Significant' if pt_result.reject_null else '✗ Not significant'}")
+
+    # ── Bootstrap confidence intervals on composite ────────────────────────
+    print("\n=== Bootstrap 95% CIs on Composite Strategy (2000 samples) ===")
+    ci = BootstrapCI(n_bootstrap=2_000, ci=0.95)
+    cis = ci.run(comp)
+    ci_col = 22
+    print(f"  {'Metric':<{ci_col}} {'Observed':>10} {'Lower 95%':>10} {'Upper 95%':>10}")
+    print("  " + "-" * (ci_col + 32))
+    for metric, vals in cis.items():
+        print(
+            f"  {metric:<{ci_col}}"
+            f" {vals['observed']:>10.3f}"
+            f" {vals['lower']:>10.3f}"
+            f" {vals['upper']:>10.3f}"
+        )
+
+    # ── Deflated Sharpe Ratio: correct for having tested 3 strategies ─────
+    print("\n=== Deflated Sharpe Ratio (3 strategies tested) ===")
+    dsr = DeflatedSharpeRatio()
+    for label, bt_res in [("EMA/RSI", result), ("Mean Rev", mr), ("Composite", comp)]:
+        d = dsr.compute(bt_res, n_trials=3)
+        verdict = "✓ Genuine edge" if d.reject_null else "✗ Likely overfit"
+        print(f"  {label:<12}  SR={d.observed_sharpe:.4f}  "
+              f"deflated_SR={d.deflated_sharpe:.4f}  "
+              f"p={d.p_value:.4f}  {verdict}")
+
+    # ── Walk-forward analysis on EMA/RSI ──────────────────────────────────
+    print("\n\n=== Walk-Forward Analysis: EMA/RSI (5 expanding folds) ===")
+    wfa = WalkForwardAnalysis(
+        strategy_cls=EmaRsiStrategy,
+        strategy_params={"fast": 50, "slow": 200},
+        fixed_params={"symbol": symbol},
+        config=config,
+        cost_model=cost_model,
+        sizer=sizer,
+        stop_loss=stoploss,
+    )
+    wf = wfa.run(universe=universe, timeframe=timeframe, n_splits=5, split_method="expanding")
+
+    print(f"  Consistency score : {wf.consistency_score:.0%}  "
+          f"(fraction of OOS folds profitable)")
+    print(f"  IS/OOS efficiency : {wf.efficiency_ratio:.2f}  "
+          f"(OOS Sharpe / IS Sharpe; 1.0 = perfect)")
+
+    tbl = wf.summary_table()
+    print("\n  Per-fold IS vs OOS Sharpe ratio:")
+    for fold, row in tbl.iterrows():
+        is_sr  = row.get("is_sharpe_ratio",  float("nan"))
+        oos_sr = row.get("oos_sharpe_ratio", float("nan"))
+        is_ret  = row.get("is_total_return_pct",  float("nan"))
+        oos_ret = row.get("oos_total_return_pct", float("nan"))
+        print(
+            f"    Fold {fold}  "
+            f"IS  ret={is_ret:>7.2f}%  SR={is_sr:>6.3f}  │  "
+            f"OOS ret={oos_ret:>7.2f}%  SR={oos_sr:>6.3f}"
+        )
+
+    oos_equity_path = wf.plot_oos_equity()
+    print(f"\n  OOS equity chart saved → {oos_equity_path}")
 
 
 if __name__ == "__main__":
