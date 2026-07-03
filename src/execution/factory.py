@@ -16,7 +16,8 @@ from typing import Callable
 
 _env = dotenv_values()
 
-from .base_executor_feed import BaseExecutor, BaseBarBuilder
+from .executor import BaseExecutor
+from core.feeds import BaseBarBuilder
 from core.feeds import BaseFeed
 from core.models import ExchangeCredentials
 

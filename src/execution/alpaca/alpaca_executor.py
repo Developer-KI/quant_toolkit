@@ -18,7 +18,7 @@ import logging
 import pandas as pd
 
 from core.models import FillResult, FundingSnapshot, Position, Side
-from execution.base_executor_feed import BaseExecutor
+from execution.executor import BaseExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +183,16 @@ class AlpacaExecutor(BaseExecutor):
         except Exception as exc:
             logger.warning("close_position(%s) failed: %s", symbol, exc)
             return FillResult(success=False, status=f"error: {exc}", exchange=self.exchange_name)
+
+    def close_all_positions(self, cancel_orders: bool = True) -> int:
+        try:
+            responses = self._client.close_all_positions(cancel_orders=cancel_orders)
+            count = len(responses) if responses else 0
+            logger.info("close_all_positions: submitted close orders for %d position(s)", count)
+            return count
+        except Exception as exc:
+            logger.error("close_all_positions failed: %s", exc)
+            return 0
 
     # ── Optional ─────────────────────────────────────────────────────────
 

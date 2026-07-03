@@ -1,4 +1,4 @@
-"""Thread wrapper for LiveEngine — stores engine lifecycle in Streamlit session state."""
+"""Thread wrapper for Engine — stores engine lifecycle in Streamlit session state."""
 from __future__ import annotations
 
 import threading
@@ -7,7 +7,7 @@ import traceback
 
 class EngineRunner:
     """
-    Runs a LiveEngine in a background daemon thread.
+    Runs an Engine in a background daemon thread.
     One instance is stored in st.session_state["runner"] for the app lifetime.
     """
 
@@ -77,5 +77,5 @@ class EngineRunner:
     def assets(self) -> dict:
         """Per-symbol _AssetLiveState dict from the running engine."""
         if self.engine is not None:
-            return getattr(self.engine, "_assets", {})
+            return self.engine.assets
         return {}

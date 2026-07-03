@@ -24,7 +24,8 @@ from typing import Any
 import pandas as pd
 
 from core.models import Side, Position, FundingSnapshot
-from ..base_executor_feed import BaseExecutor, FillResult
+from core.models import FillResult
+from ..executor import BaseExecutor
 
 logger = logging.getLogger(__name__)
 

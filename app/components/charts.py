@@ -453,6 +453,48 @@ def funding_rate_mini(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def macd_chart(
+    close: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> go.Figure:
+    """MACD line + signal line (top) and histogram (bottom), shared x-axis."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+
+    fig = sp.make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.6, 0.4], vertical_spacing=0.02,
+    )
+    fig.add_trace(go.Scatter(
+        x=macd_line.index, y=macd_line.values,
+        name=f"MACD({fast},{slow})", line=dict(color=_BLUE, width=1.5),
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=signal_line.index, y=signal_line.values,
+        name=f"Signal({signal})", line=dict(color=_ORANGE, width=1.5),
+    ), row=1, col=1)
+    bar_colors = [_GREEN if v >= 0 else _RED for v in histogram]
+    fig.add_trace(go.Bar(
+        x=histogram.index, y=histogram.values,
+        name="Histogram", marker_color=bar_colors, showlegend=False,
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_color="gray", line_width=0.5, opacity=0.4, row=2, col=1)
+    fig.update_layout(
+        template=_DARK, height=250,
+        hovermode="x unified",
+        margin=_MARGIN_MINI,
+        legend=_LEGEND_H,
+    )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
+    return fig
+
+
 def macro_chart(df: pd.DataFrame, col: str, label: str, color: str = _BLUE) -> go.Figure:
     """Generic macro time-series area chart."""
     if df.empty or col not in df.columns:

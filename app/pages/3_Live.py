@@ -1,4 +1,4 @@
-"""Live Trading — configure, launch, and monitor the live engine."""
+"""Live Trading — configure, launch, and monitor the Alpaca live engine."""
 import sys
 import time
 from pathlib import Path
@@ -11,6 +11,7 @@ for _p in [str(_ROOT / "src"), str(_ROOT), str(_ROOT / "app")]:
 import pandas as pd
 import streamlit as st
 
+from components.alpaca_data import TIMEFRAMES, get_credentials, to_core_timeframe
 from components.charts import candlestick_chart
 from components.forms import signal_form, sizer_form, stop_form
 from components.style import inject
@@ -35,54 +36,21 @@ col_cfg, col_dash = st.columns([4, 6])
 
 with col_cfg:
     st.subheader("Configuration")
-    disabled = runner.is_alive  # lock form while engine is running
-
-    # Exchange
-    exchange = st.selectbox("Exchange", ["hyperliquid", "binance", "alpaca"],
-                             key="live_exch", disabled=disabled)
-    use_testnet = st.checkbox("Use testnet", value=True, key="live_testnet", disabled=disabled)
+    disabled = runner.is_alive
 
     # Credentials
-    with st.expander("Credentials", expanded=not disabled):
-        try:
-            from dotenv import dotenv_values
-            env = dotenv_values(_ROOT / ".env")
-        except Exception:
-            env = {}
-
-        if exchange == "hyperliquid":
-            addr = st.text_input("Account address",
-                                  value=env.get("HL_ACCOUNT_ADDRESS", ""),
-                                  type="password", key="live_addr", disabled=disabled)
-            secret = st.text_input("Secret key",
-                                    value=env.get("HL_SECRET_KEY", ""),
-                                    type="password", key="live_secret", disabled=disabled)
-            api_key = api_secret = ""
-        elif exchange == "binance":
-            addr = secret = ""
-            api_key = st.text_input("API key",
-                                     value=env.get("BINANCE_API_KEY", ""),
-                                     type="password", key="live_api_key", disabled=disabled)
-            api_secret = st.text_input("API secret",
-                                        value=env.get("BINANCE_API_SECRET", ""),
-                                        type="password", key="live_api_secret", disabled=disabled)
-        else:  # alpaca
-            addr = secret = ""
-            api_key = st.text_input("Alpaca API key (paper)",
-                                     value=env.get("ALP_PAPER_KEY", ""),
-                                     type="password", key="live_alp_key", disabled=disabled)
-            api_secret = st.text_input("Alpaca API secret (paper)",
-                                        value=env.get("ALP_PAPER_SECRET", ""),
-                                        type="password", key="live_alp_secret", disabled=disabled)
-            st.caption("Paper trading — no leverage; market hours apply (9:30–16:00 ET)")
+    with st.expander("Alpaca API", expanded=not disabled):
+        env_key, env_secret = get_credentials()
+        api_key = st.text_input("API Key",    value=env_key,    type="password", key="live_alp_key",    disabled=disabled)
+        api_secret = st.text_input("API Secret", value=env_secret, type="password", key="live_alp_secret", disabled=disabled)
+        paper = st.checkbox("Paper trading", value=True, key="live_paper", disabled=disabled)
+        st.caption("Paper trading — no leverage; market hours 9:30–16:00 ET")
 
     # Market
-    symbol = st.text_input("Symbol", value="ETH", key="live_sym", disabled=disabled).upper()
-    from core.parser import TIMEFRAMES, timeframe_to_seconds
-    live_timeframe = st.selectbox("Bar timeframe", TIMEFRAMES, index=0,
-                                   key="live_tf", disabled=disabled)
-    warmup_bars = st.number_input("Warm-up bars", value=200, step=10,
-                                   min_value=10, key="live_warmup", disabled=disabled)
+    from core.parser import timeframe_to_seconds
+    symbol = st.text_input("Symbol", value="SPY", key="live_sym", disabled=disabled).upper()
+    live_timeframe = st.selectbox("Bar timeframe", TIMEFRAMES, index=0, key="live_tf", disabled=disabled)
+    warmup_bars = st.number_input("Warm-up bars", value=200, step=10, min_value=10, key="live_warmup", disabled=disabled)
 
     # Risk
     st.markdown("**Risk**")
@@ -111,21 +79,18 @@ with col_cfg:
 
     # Control buttons
     btn_start, btn_stop, btn_flat = st.columns(3)
-
     with btn_start:
         start_pressed = st.button(
             "Start Engine", type="primary",
             disabled=runner.is_alive or live_signal_cls is None,
             use_container_width=True,
         )
-
     with btn_stop:
         stop_pressed = st.button(
             "Stop Engine",
             disabled=not runner.is_alive,
             use_container_width=True,
         )
-
     with btn_flat:
         flat_pressed = st.button(
             "Emergency Flatten",
@@ -138,31 +103,34 @@ with col_cfg:
 
 if start_pressed and live_signal_cls is not None:
     try:
-        from core.models import LiveConfig
-        from execution.single_exchange_engine import LiveEngine
+        from core.models import LiveConfig, ExchangeCredentials
+        from execution import Engine
+        from strategy.built_in import SingleAssetStrategy
 
-        from core.models import ExchangeCredentials
+        if issubclass(live_signal_cls, SingleAssetStrategy):
+            live_strategy = live_signal_cls(symbol=symbol, **live_sig_params)
+        else:
+            live_strategy = live_signal_cls(**live_sig_params)
+
         config = LiveConfig(
-            exchange=exchange,
-            use_testnet=use_testnet,
+            exchange="alpaca",
+            use_testnet=paper,
             exchanges=[ExchangeCredentials(
-                exchange=exchange,
-                account_address=addr,
-                secret_key=secret,
+                exchange="alpaca",
                 api_key=api_key,
                 api_secret=api_secret,
-                testnet=use_testnet,
+                testnet=paper,
             )],
             symbol=symbol,
-            bar_interval_s=timeframe_to_seconds(live_timeframe),
+            bar_interval_s=timeframe_to_seconds(to_core_timeframe(live_timeframe)),
             warmup_bars=int(warmup_bars),
             max_position_pct=max_pos_pct,
             leverage=leverage,
             max_daily_trades=int(max_daily_trades),
             max_daily_loss_pct=max_daily_loss,
         )
-        engine = LiveEngine(
-            signal=live_signal_cls(**live_sig_params),
+        engine = Engine(
+            strategy=live_strategy,
             config=config,
             sizer=live_sizer,
             stop_loss=live_stop,
@@ -198,7 +166,7 @@ with col_dash:
     elif status == "starting":
         st.info("Engine is **starting** (warming up)…")
     elif status == "error":
-        st.error(f"Engine stopped with error")
+        st.error("Engine stopped with error")
         if runner.error:
             with st.expander("Error details"):
                 st.code(runner.error)
@@ -207,13 +175,11 @@ with col_dash:
 
     state = runner.state
     if state is not None:
-        # Key metrics
         mc1, mc2, mc3, mc4 = st.columns(4)
         mc1.metric("Equity", f"${state.equity:,.2f}")
 
         daily_pnl_pct = (state.daily_pnl / state.starting_equity * 100) if state.starting_equity else 0
-        mc2.metric("Daily PnL", f"${state.daily_pnl:,.2f}",
-                   delta=f"{daily_pnl_pct:+.2f}%")
+        mc2.metric("Daily PnL", f"${state.daily_pnl:,.2f}", delta=f"{daily_pnl_pct:+.2f}%")
 
         pos = state.position
         mc3.metric("Position", f"{pos.side.name} {pos.size:.4f}" if pos.size else "FLAT")
@@ -221,7 +187,7 @@ with col_dash:
         peak_dd = ((state.equity - state.peak_equity) / state.peak_equity * 100) if state.peak_equity else 0
         mc4.metric("Peak DD", f"{peak_dd:.2f}%")
 
-        # Daily limits progress
+        # Daily limits
         st.markdown("**Daily limits**")
         if state.starting_equity and runner.engine:
             max_loss = runner.engine.config.max_daily_loss_pct / 100
@@ -234,22 +200,21 @@ with col_dash:
 
         st.divider()
 
-        # Live price chart (last 100 bars)
+        # Live price chart
         assets = runner.assets
         if assets:
-            first_sym = next(iter(assets))
-            ast = assets[first_sym]
+            first_key = next(iter(assets))
+            ast = assets[first_key]
+            display_sym = first_key.split(":", 1)[-1]
             if ast.bar_builder is not None:
                 try:
                     live_df = ast.bar_builder.to_dataframe()
                     if not live_df.empty:
                         live_view = live_df.tail(100)
-                        fig_live = candlestick_chart(
-                            live_view,
-                            title=f"{first_sym} — last {len(live_view)} bars",
-                            height=350,
+                        st.plotly_chart(
+                            candlestick_chart(live_view, title=f"{display_sym} — last {len(live_view)} bars", height=350),
+                            use_container_width=True,
                         )
-                        st.plotly_chart(fig_live, use_container_width=True)
                 except Exception:
                     pass
 
@@ -263,8 +228,7 @@ with col_dash:
                     oc2.metric("Size", f"{open_trade.size:.4f}")
                     oc3.metric("Entry", f"${open_trade.entry_price:,.4f}")
                     if state.positions:
-                        curr_pos = state.position
-                        unr = curr_pos.unrealized_pnl
+                        unr = state.position.unrealized_pnl
                         st.metric("Unrealised PnL", f"${unr:+,.2f}" if unr else "—")
 
         # Closed trades
@@ -274,12 +238,12 @@ with col_dash:
             rows = []
             for t in reversed(closed[-50:]):
                 rows.append({
-                    "Time": str(t.timestamp)[:19],
-                    "Side": t.side.name,
-                    "Size": f"{t.size:.4f}",
+                    "Time":  str(t.timestamp)[:19],
+                    "Side":  t.side.name,
+                    "Size":  f"{t.size:.4f}",
                     "Entry": f"${t.entry_price:,.4f}",
-                    "Exit": f"${t.exit_price:,.4f}" if t.exit_price else "—",
-                    "PnL": f"${t.pnl:+,.2f}",
+                    "Exit":  f"${t.exit_price:,.4f}" if t.exit_price else "—",
+                    "PnL":   f"${t.pnl:+,.2f}",
                     "Reason": t.reason_exit or "—",
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True)

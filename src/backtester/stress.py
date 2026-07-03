@@ -1,13 +1,12 @@
 """
 stress.py — Modular stress testing framework.
 
-Five types of stress tests:
-  1. ParamSweep       — sweep SingleAssetStrategy parameters (grid or random)
-  2. StrategyStressTest — sweep Strategy parameters (multi-asset)
-  3. CostStressTest   — sweep cost assumptions (fees, slippage, impact)
-  4. RegimeStressTest — test across market regime subsets (vol, trend, etc.)
-  5. MonteCarloStress — bootstrap / shuffle trades to build confidence intervals
-  
+Four types of stress tests:
+  1. ParamSweep       — sweep any Strategy parameters (grid or random); works for
+                        both single-asset and multi-asset strategies
+  2. RegimeStressTest — test across market regime subsets (vol, trend, etc.)
+  3. MonteCarloStress — bootstrap / shuffle trades to build confidence intervals
+
 
 All tests return a StressResult with a summary DataFrame and optional plots.
 """
@@ -16,6 +15,8 @@ from __future__ import annotations
 
 import copy
 import itertools
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -23,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from core.models import BacktestConfig
-from .costs import CostModel, CompositeCostModel
+from .costs import CostModel
 from .engine import Backtester, BacktestResult
 
 from strategy.base import Strategy
@@ -78,40 +79,61 @@ class StressResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. Parameter sweep (single-asset strategy)
+# 1. Parameter sweep (any Strategy — single- or multi-asset)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class ParamSweep:
     """
-    Grid/random sweep over SingleAssetStrategy parameters.
+    Grid/random sweep over Strategy constructor parameters.
 
-    Usage:
+    Works for both SingleAssetStrategy and multi-asset Strategy subclasses.
+    For SingleAssetStrategy, the first symbol in the universe is injected
+    automatically as the ``symbol`` argument.
+
+    Usage (single-asset):
         sweep = ParamSweep(
             strategy_cls=EMACrossStrategy,
             param_grid={"fast": [5, 8, 12, 20], "slow": [21, 26, 50]},
         )
         result = sweep.run(universe=universe, timeframe="1h")
         result.plot_heatmap("fast", "slow")
+
+    Usage (multi-asset):
+        sweep = ParamSweep(
+            strategy_cls=ZPairsSpreadStrategy,
+            param_grid={"lookback": [30, 60, 120], "entry_z": [1.5, 2.0, 2.5]},
+            fixed_params={"asset_a": "BTC", "asset_b": "ETH"},
+        )
+        result = sweep.run(universe=universe)
+
+    Set ``n_jobs=-1`` (default) to use all CPU cores, or ``n_jobs=1`` for
+    sequential execution (useful when debugging exceptions).
     """
 
     def __init__(
         self,
-        strategy_cls: type[SingleAssetStrategy],
+        strategy_cls: type[Strategy],
         param_grid: dict[str, list],
         config: BacktestConfig | None = None,
         cost_model: CostModel | None = None,
+        sizer=None,
+        stop_loss=None,
         fixed_params: dict | None = None,
         n_random: int | None = None,
         seed: int = 42,
+        n_jobs: int = -1,
     ):
         self.strategy_cls = strategy_cls
         self.param_grid = param_grid
         self.config = config or BacktestConfig()
         self.cost_model = cost_model
+        self.sizer = sizer
+        self.stop_loss = stop_loss
         self.fixed_params = fixed_params or {}
         self.n_random = n_random
         self.seed = seed
+        self.n_jobs = n_jobs
 
     def _build_combos(self) -> list[dict]:
         keys = list(self.param_grid.keys())
@@ -123,29 +145,49 @@ class ParamSweep:
             combos = [combos[i] for i in idx]
         return combos
 
+    def _run_one(
+        self, combo: dict, universe: Universe, timeframe: str | None
+    ) -> tuple[dict, BacktestResult | None, str | None]:
+        params = {**self.fixed_params, **combo}
+        if issubclass(self.strategy_cls, SingleAssetStrategy):
+            sym = universe.symbols[0] if universe.symbols else "ASSET"
+            strategy = self.strategy_cls(symbol=sym, **params)
+        else:
+            strategy = self.strategy_cls(**params)
+
+        bt = Backtester(
+            strategy=strategy,
+            config=self.config,
+            cost_model=self.cost_model,
+            sizer=self.sizer,
+            stop_loss=self.stop_loss,
+        )
+        try:
+            res = bt.run(universe=copy.deepcopy(universe), timeframe=timeframe)
+            return combo, res, None
+        except Exception as e:
+            return combo, None, str(e)
+
     def run(
         self,
         universe: Universe,
         timeframe: str | None = None,
     ) -> StressResult:
         combos = self._build_combos()
-        rows = []
-        results = {}
-        sym = universe.symbols[0] if universe.symbols else "ASSET"
+        rows: list[dict] = []
+        results: dict[str, BacktestResult] = {}
+        n_workers = os.cpu_count() if self.n_jobs == -1 else self.n_jobs
 
-        for combo in combos:
-            params = {**self.fixed_params, **combo}
-            strategy = self.strategy_cls(symbol=sym, **params)
-            bt = Backtester(strategy=strategy, config=self.config, cost_model=self.cost_model)
+        def _call(combo: dict):
+            return self._run_one(combo, universe, timeframe)
 
-            try:
-                res = bt.run(universe=universe, timeframe=timeframe)
-                summary = res.summary()
-                key = str(combo)
-                rows.append({**combo, **summary})
-                results[key] = res
-            except Exception as e:
-                rows.append({**combo, "error": str(e)})
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for combo, res, err in ex.map(_call, combos):
+                if res is not None:
+                    rows.append({**combo, **res.summary()})
+                    results[str(combo)] = res
+                else:
+                    rows.append({**combo, "error": err})
 
         return StressResult(
             name="param_sweep",
@@ -155,94 +197,7 @@ class ParamSweep:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2. Transaction cost stress test
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class CostStressTest:
-    """
-    Sweep transaction cost parameters to find where alpha breaks down.
-
-    Usage:
-        cst = CostStressTest(cost_grid={...})
-        result = cst.run(strategy=my_strategy, universe=my_universe)
-    """
-
-    def __init__(
-        self,
-        cost_grid: dict[str, dict[str, list]],
-        base_cost_model: CompositeCostModel | None = None,
-        config: BacktestConfig | None = None,
-    ):
-        self.cost_grid = cost_grid
-        self.base_cost_model = base_cost_model or CompositeCostModel()
-        self.config = config or BacktestConfig()
-
-    def _build_cost_combos(self) -> list[dict[str, dict[str, Any]]]:
-        """Build all combinations across cost model parameters."""
-        all_keys = []
-        all_vals = []
-        key_map = []  # (model_name, param_name)
-
-        for model_name, params in self.cost_grid.items():
-            for param_name, values in params.items():
-                all_keys.append(f"{model_name}.{param_name}")
-                all_vals.append(values)
-                key_map.append((model_name, param_name))
-
-        combos = []
-        for combo_vals in itertools.product(*all_vals):
-            override = {}
-            for (model_name, param_name), val in zip(key_map, combo_vals):
-                if model_name not in override:
-                    override[model_name] = {}
-                override[model_name][param_name] = val
-            combos.append(override)
-        return combos
-
-    def run(
-        self,
-        strategy: Strategy,
-        universe: Universe,
-    ) -> StressResult:
-        combos = self._build_cost_combos()
-        rows = []
-        results = {}
-
-        for combo in combos:
-            cost_model = self.base_cost_model.with_overrides(**combo)
-            bt = Backtester(
-                strategy=copy.deepcopy(strategy),
-                config=self.config,
-                cost_model=cost_model,
-            )
-
-            try:
-                res = bt.run(universe=universe)
-                summary = res.summary()
-                flat_combo = {}
-                for mn, ps in combo.items():
-                    for pn, pv in ps.items():
-                        flat_combo[f"{mn}__{pn}"] = pv
-                key = str(flat_combo)
-                rows.append({**flat_combo, **summary})
-                results[key] = res
-            except Exception as e:
-                flat_combo = {}
-                for mn, ps in combo.items():
-                    for pn, pv in ps.items():
-                        flat_combo[f"{mn}__{pn}"] = pv
-                rows.append({**flat_combo, "error": str(e)})
-
-        return StressResult(
-            name="cost_sweep",
-            summary=pd.DataFrame(rows),
-            results=results,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. Regime-based stress test
+# 2. Regime-based stress test
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -253,6 +208,9 @@ class RegimeStressTest:
     Usage:
         rst = RegimeStressTest(regime_fn=my_classifier, regime_symbol="BTC")
         result = rst.run(strategy=my_strategy, universe=my_universe)
+
+    Set ``n_jobs=-1`` (default) to use all CPU cores, or ``n_jobs=1`` for
+    sequential execution.
     """
 
     def __init__(
@@ -261,11 +219,13 @@ class RegimeStressTest:
         config: BacktestConfig | None = None,
         cost_model: CostModel | None = None,
         regime_symbol: str | None = None,
+        n_jobs: int = -1,
     ):
         self.regime_fn = regime_fn or self._default_vol_regime
         self.config = config or BacktestConfig()
         self.cost_model = cost_model
         self.regime_symbol = regime_symbol
+        self.n_jobs = n_jobs
 
     @staticmethod
     def _default_vol_regime(data: pd.DataFrame) -> pd.Series:
@@ -347,6 +307,24 @@ class RegimeStressTest:
 
         return sub_universe
 
+    def _run_regime(
+        self,
+        strategy: Strategy,
+        regime: str,
+        sub_universe: Universe,
+    ) -> tuple[str, int, BacktestResult | None, str | None]:
+        bt = Backtester(
+            strategy=copy.deepcopy(strategy),
+            config=self.config,
+            cost_model=self.cost_model,
+        )
+        n_bars = sub_universe.bar_count()
+        try:
+            res = bt.run(universe=sub_universe)
+            return regime, n_bars, res, None
+        except Exception as e:
+            return regime, n_bars, None, str(e)
+
     def run(
         self,
         strategy: Strategy,
@@ -357,40 +335,35 @@ class RegimeStressTest:
 
         regimes = self.regime_fn(ref_data)
         unique_regimes = regimes.dropna().unique()
-        rows = []
-        results = {}
 
+        # Build subset universes up front (sequential — they share universe reads)
+        regime_tasks: list[tuple[str, Universe]] = []
         for regime in unique_regimes:
             mask = regimes == regime
             subset_idx = ref_data.index[mask]
             if len(subset_idx) < 50:
                 continue
-
             sub_universe = self._build_subset_universe(universe, subset_idx)
             if sub_universe.bar_count() < 50:
                 continue
+            regime_tasks.append((regime, sub_universe))
 
-            bt = Backtester(
-                strategy=copy.deepcopy(strategy),
-                config=self.config,
-                cost_model=self.cost_model,
-            )
+        rows: list[dict] = []
+        results: dict[str, BacktestResult] = {}
+        n_workers = os.cpu_count() if self.n_jobs == -1 else self.n_jobs
 
-            try:
-                res = bt.run(universe=sub_universe)
-                summary = res.summary()
-                rows.append({
-                    "regime": regime,
-                    "n_bars": sub_universe.bar_count(),
-                    **summary,
-                })
-                results[str(regime)] = res
-            except Exception as e:
-                rows.append({
-                    "regime": regime,
-                    "n_bars": sub_universe.bar_count(),
-                    "error": str(e),
-                })
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = [
+                ex.submit(self._run_regime, strategy, regime, sub_u)
+                for regime, sub_u in regime_tasks
+            ]
+            for future in futures:
+                regime, n_bars, res, err = future.result()
+                if res is not None:
+                    rows.append({"regime": regime, "n_bars": n_bars, **res.summary()})
+                    results[str(regime)] = res
+                else:
+                    rows.append({"regime": regime, "n_bars": n_bars, "error": err})
 
         return StressResult(
             name="regime_stress",
@@ -400,7 +373,7 @@ class RegimeStressTest:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4. Monte Carlo stress test
+# 3. Monte Carlo stress test
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -518,122 +491,3 @@ class MonteCarloStress:
         fig.savefig(path, dpi=150)
         plt.close(fig)
         return path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 5. Strategy parameter stress test
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class StrategyStressTest:
-    """
-    Grid/random sweep over Strategy parameters (multi-asset analogue of
-    ParamSweep).
-
-    The strategy_cls is instantiated fresh for each parameter combo, so
-    the sweep covers constructor arguments.  Use ``fixed_params`` for
-    arguments that should stay constant across all runs.
-
-    Usage:
-        sst = StrategyStressTest(
-            strategy_cls=ZPairsSpreadStrategy,
-            param_grid={
-                "lookback": [30, 60, 120],
-                "entry_z": [1.5, 2.0, 2.5],
-                "exit_z": [0.3, 0.5, 1.0],
-            },
-        )
-        result = sst.run(universe=my_universe)
-        result.plot_heatmap("lookback", "entry_z")
-
-    For strategies that require non-serialisable constructor args, pass them
-    in ``fixed_params``:
-
-        sst = StrategyStressTest(
-            strategy_cls=PerAssetStrategy,
-            param_grid={"some_threshold": [0.3, 0.5]},
-            fixed_params={"strategies": {"ETH": eth_strat, "BTC": btc_strat}},
-        )
-    """
-
-    def __init__(
-        self,
-        strategy_cls: type,
-        param_grid: dict[str, list],
-        config: BacktestConfig | None = None,
-        cost_model: CostModel | None = None,
-        sizer=None,
-        stop_loss=None,
-        fixed_params: dict | None = None,
-        n_random: int | None = None,
-        seed: int = 42,
-    ):
-        self.strategy_cls = strategy_cls
-        self.param_grid = param_grid
-        self.config = config or BacktestConfig()
-        self.cost_model = cost_model
-        self.sizer = sizer
-        self.stop_loss = stop_loss
-        self.fixed_params = fixed_params or {}
-        self.n_random = n_random
-        self.seed = seed
-
-    def _build_combos(self) -> list[dict]:
-        keys = list(self.param_grid.keys())
-        vals = list(self.param_grid.values())
-        combos = [dict(zip(keys, v)) for v in itertools.product(*vals)]
-        if self.n_random and self.n_random < len(combos):
-            rng = np.random.default_rng(self.seed)
-            idx = rng.choice(len(combos), size=self.n_random, replace=False)
-            combos = [combos[i] for i in idx]
-        return combos
-
-    def run(
-        self,
-        universe: Universe,
-        timeframe: str | None = None,
-    ) -> StressResult:
-        """
-        Run parameter sweep over the strategy.
-
-        Args:
-            universe:   Multi-asset Universe containing all OHLCV + aux data.
-            timeframe:  Bar size label (e.g. "1m", "1h") for annualisation.
-                        When omitted, inferred from the bar index spacing.
-
-        Returns:
-            StressResult with one row per parameter combination.
-        """
-        combos = self._build_combos()
-        rows = []
-        results = {}
-
-        for combo in combos:
-            params = {**self.fixed_params, **combo}
-            strat = self.strategy_cls(**params)
-
-            bt = Backtester(
-                strategy=strat,
-                config=self.config,
-                cost_model=self.cost_model,
-                sizer=self.sizer,
-                stop_loss=self.stop_loss,
-            )
-
-            try:
-                res = bt.run(
-                    universe=copy.deepcopy(universe),
-                    timeframe=timeframe,
-                )
-                summary = res.summary()
-                key = str(combo)
-                rows.append({**combo, **summary})
-                results[key] = res
-            except Exception as e:
-                rows.append({**combo, "error": str(e)})
-
-        return StressResult(
-            name="strategy_sweep",
-            summary=pd.DataFrame(rows),
-            results=results,
-        )

@@ -52,18 +52,15 @@ if "runner" not in st.session_state:
     from components.engine_runner import EngineRunner
     st.session_state["runner"] = EngineRunner()
 
-DATA_DIR = _ROOT / "data"
-st.session_state["data_dir"] = DATA_DIR
-
 # ── Home page ─────────────────────────────────────────────────────────────────
 
 st.title("Trading Dashboard")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.info("**Data Explorer**\n\nBrowse OHLCV, order book snapshots, funding rates, sentiment scores, and macro data.")
+    st.info("**Data Visualizer**\n\nLoad Alpaca bars for any symbol, period, and timeframe. Overlay EMA, SMA, Bollinger Bands, RSI, ATR, and MACD. Optionally overlay a strategy's signals to explore its behaviour on the data.")
 with col2:
-    st.info("**Backtester**\n\nConfigure signals, sizers, and stops, run vectorised backtests, inspect equity curves and trade logs, sweep parameters.")
+    st.info("**Backtester**\n\nSelect a strategy, configure sizing and stop-loss, and run a vectorised backtest on Alpaca data. Inspect equity curves, trade logs, and run parameter sweeps, regime tests, and Monte Carlo simulations.")
 with col3:
     runner = st.session_state["runner"]
     status = runner.status
@@ -72,7 +69,4 @@ with col3:
     elif status == "error":
         st.error("**Live Engine**\n\nEngine stopped with an error. Check the Live page.")
     else:
-        st.warning("**Live Engine**\n\nEngine is stopped. Go to the Live page to configure and launch it.")
-
-st.divider()
-st.caption(f"Data root: `{DATA_DIR}`")
+        st.warning("**Live Engine**\n\nEngine is stopped. Go to the Live page to configure and launch it on Alpaca paper or live trading.")
