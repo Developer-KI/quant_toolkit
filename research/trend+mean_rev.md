@@ -1,0 +1,139 @@
+# Designing a Dual-Signal Swing Trading Strategy for the S&P 500: Trend-Following + Mean-Reversion
+
+## TL;DR
+- **The concept is sound and grounded in robust literature: a long-only trend leg reduces drawdowns/volatility (not raw return) while a long-biased short-term mean-reversion leg harvests choppiness — and because the two return streams are lowly-to-negatively correlated, combining them raises portfolio Sharpe more than either leg alone.** Trend-following on a single equity index is a defensive risk-management overlay, not a return enhancer; the mean-reversion long side is the more durable edge.
+- **Trade it on ES/MES futures rather than SPY** for capital efficiency, no borrow cost to short, and Section 1256 60/40 tax treatment (blended top federal rate ~26.8% vs 37% for short-term SPY gains) — using MES for granular sizing on smaller accounts.
+- **Temper expectations and validate out-of-sample.** Published backtests (Faber SMA-10, Connors RSI(2)) are real but overstated once realistic costs, look-ahead bias, and out-of-sample decay are accounted for (Zakamulin); the short-mean-reversion leg is the fragile, most-likely-to-fail component and should be small, regime-gated, and treated as optional.
+
+## Key Findings
+
+1. **Trend-following on equities is one of the most statistically robust anomalies known**, but on a *single* index its value is downside protection, not extra return. Moskowitz, Ooi & Pedersen (2012) document 12-month time-series momentum across 58 instruments; Hurst, Ooi & Pedersen (2017) show positive returns every decade since 1880; Lempérière et al. (2014) find a t-stat ≈10 over two centuries.
+2. **The classic 10-month SMA / 200-day SMA rule (Faber 2007) delivers roughly equity-like returns with bond-like drawdowns** — but the outperformance is concentrated in bear markets, and Zakamulin's out-of-sample, cost-adjusted work shows the risk-adjusted edge is far smaller than headline backtests claim.
+3. **Short-term mean reversion in the S&P is well-documented and has strengthened since the late 1990s** (negative daily/weekly autocorrelation). Connors' RSI(2) and IBS systems show high win rates on the long side above the 200-day MA.
+4. **The short side is the weak link.** Shorting fights the equity drift; Connors himself and practitioners note short setups work better *above* the 200-day MA and require more extreme overbought readings, with severe left-tail (short-squeeze) risk.
+5. **Combining the legs is the real edge.** Trend and reversion are structurally complementary/uncorrelated; equal-weighting them raises Sharpe. Volatility targeting (Moreira & Muir 2017) further improves risk-adjusted returns but decays out-of-sample.
+
+## Summary Table of Key Published Strategies and Results
+
+| Strategy / Study | Source (author, year, outlet) | Rule / horizon | Reported result | Robustness verdict |
+|---|---|---|---|---|
+| Time-series momentum | Moskowitz, Ooi & Pedersen, *JFE* 104(2), 2012 (SSRN 2089463) | 12-month lookback, 1-month hold, 58 futures | Significant positive predictability all asset classes; persists 1–12 mo then reverses | **Robust** (cross-asset) |
+| A Century of Evidence | Hurst, Ooi & Pedersen, *JPM* 44(1), 2017 (SSRN 2993026) | Diversified trend since 1880 | Positive every decade; worked in 8/10 worst 60/40 crises | **Robust** (diversified) |
+| Two Centuries of Trend | Lempérière et al., *J. Investment Strategies* 3(3), 2014 (arXiv 1404.3274) | EWMA trend, monthly | t-stat ≈5 since 1960, ≈10 since 1800; Sharpe <0.8 aggregate | **Robust** (diversified) |
+| 10-month SMA timing | Faber, *J. Wealth Mgmt* Spring 2007 (SSRN 962461) | Long if price>10-mo SMA, else cash; monthly | 5-asset 1973–2012: 10.5% vs 9.9%, Sharpe 0.73 vs 0.44, MaxDD −9.5% vs −46% | **Real but overstated** |
+| Real-life MA timing critique | Zakamulin, *J. Asset Mgmt* 15(4), 2014 (SSRN 2242795) | OOS + 0.5% costs, S&P 1926–2012 | OOS Sharpe only ~10% > B&H (0.120 vs 0.109); capital growth 2–3× lower | **Critical realism check** |
+| Look-ahead-bias critique | Zakamulin, *Int. Rev. Finance* 18(2), 2018 | Corrects Glabadanidis (2015) | "at best… only marginally better… indistinguishable from buy-and-hold" | **Critical realism check** |
+| Dual Momentum | Antonacci, SSRN 2042750, 2017 | Absolute + relative 12-mo momentum | Absolute momentum "does far more to lessen volatility and drawdown" | **Robust (abs. mom.)** |
+| Short-term reversal | Jegadeesh (1990) *JoF*; Lehmann (1990) *QJE* | 1-week/1-month contrarian | ~2%/mo (1934–87); weekly reversals | **Robust but cross-sectional, cost-sensitive** |
+| RSI(2) | Connors & Alvarez, *STTSTW*, 2008 | Long if >200-SMA & RSI(2)<5–10; exit >5-SMA | S&P 1995–2007: 49 signals, 83.6% "correct," ~3-day hold | **Real, degrades OOS** |
+| Internal Bar Strength | Pagonidis, NAAIM, 2013 | IBS=(C−L)/(H−L); buy <0.2 | Next-day +0.35% (IBS<0.2) vs −0.13% (IBS>0.8), sig. at 1% | **Robust long-side signal** |
+| Volatility-managed | Moreira & Muir, *JoF* 72(4), 2017 (SSRN 2659431) | Scale inversely to realized variance | Large alphas, higher Sharpe in-sample | **In-sample strong, OOS decays** |
+
+## Details
+
+### A. Trend-Following on Equity Indices — the evidence
+
+**Time-series momentum.** The foundational paper is Moskowitz, Ooi & Pedersen, "Time Series Momentum," *Journal of Financial Economics* 104(2), 2012, 228–250 (SSRN 2089463; AQR dataset available). They find "strong positive predictability from a security's own past returns" for 58 futures across asset classes, with the "past 12-month excess return … a positive predictor of its future return," persisting ~1 year then partially reversing. This 1–12 month persistence is the empirical backbone for lookbacks in the 3–12 month range.
+
+Hurst, Ooi & Pedersen, "A Century of Evidence on Trend-Following Investing," *Journal of Portfolio Management* 44(1), 2017, 15–29 (SSRN 2993026), extend this to 1880 and find time-series momentum "delivered positive average returns" in every decade and "performed well in 8 out of 10 of the largest crisis periods." Lempérière, Deremble, Seager, Potters & Bouchaud, "Two Centuries of Trend Following," *Journal of Investment Strategies* 3(3), 2014, 41–61 (arXiv 1404.3274), report an aggregate "t-stat ≈ 5 since 1960 and ≈ 10 since 1800" after accounting for drift, calling trends "one of the most statistically significant anomalies in financial markets," and note 10-year trend-following performance "has never been negative in two centuries." Note the Sharpe on the diversified aggregate is below 0.8, implying multi-year drawdowns are normal.
+
+**Crucial caveat:** all of these document trend-following on *diversified multi-asset portfolios*. On a single equity index the effect is far weaker and primarily manifests as drawdown reduction.
+
+**Moving-average timing rules.** Meb Faber, "A Quantitative Approach to Tactical Asset Allocation," *Journal of Wealth Management* Spring 2007 (SSRN 962461 — the most-downloaded paper on SSRN), popularized: *Buy when monthly price > 10-month SMA; move to cash otherwise*, evaluated monthly. Faber's own reported numbers (1901–2012): the timing rule on the S&P had approximately the same arithmetic return as buy-and-hold (11.72% vs 11.66%) but higher compound return (10.66% vs 9.75%) and much lower volatility/drawdown. Applied across five asset classes (1973–2012, per CXO Advisory's summary), SMA-10 timing produced ~10.5% annualized vs 9.9% buy-and-hold, Sharpe 0.73 vs 0.44, and max drawdown −9.5% vs −46.0%. Faber notes parameter stability "from 3 months on out to over 12 months." The strategy sits in cash ~30% of the time and underperforms in roaring bull markets (it underperformed stocks in six of eight years after 2008).
+
+Jeremy Siegel (*Stocks for the Long Run*) tested a 200-day SMA rule on the Dow (1886–2006), buying 1% above / selling 1% below, and found improved risk-adjusted returns; Faber's 10-month SMA is the monthly analogue.
+
+**The Zakamulin critique (essential realism).** Valeriy Zakamulin, "The Real-Life Performance of Market Timing with Moving Average and Time-Series Momentum Rules," *Journal of Asset Management* 15(4), 2014, 261–278 (SSRN 2242795), performed out-of-sample tests with realistic transaction costs (0.5% one-way for stocks) on the S&P Composite 1926–2012. His conclusion: "the reported performance of market timing strategies usually contains a considerable data-mining bias and ignores important market frictions" and "the performance of market timing strategies is highly overstated, to say the least." Out-of-sample the S&P SMA timing Sharpe was only ~10% higher than buy-and-hold (0.120 vs 0.109), and his bootstrap test could not statistically distinguish the two — "in only 3 out of 100 simulations the difference in the Sharpe ratios of the market timing and buy-and-hold strategies happens to be greater than the actual historical difference" (p-value 0.03). Capital growth was two to three times *lower* than buy-and-hold. Critically, he confirms the risk-reduction mechanism: MA timing cuts volatility ~30% (by sitting in cash ~30% of the time) but "the reduction of risk always comes at the expense of reduction of returns," and warns the realistic strategy can have a "fatter left tail" than buy-and-hold, so downside protection is not guaranteed (realistic OOS max drawdown was still −61.68% vs −79.18%).
+
+His follow-up, Zakamulin, "Revisiting the Profitability of Market Timing with Moving Averages," *International Review of Finance* 18(2), 2018, 317–327, demonstrated that Glabadanidis's (2015) "striking" MA results were driven by *look-ahead bias* (trading on the same month's return used to generate the signal). Per his abstract, the "'too good to be true' reported performance … is due to simulating trading with look-ahead bias … at best, the performance of the moving average strategy is only marginally better than that of the corresponding buy-and-hold strategy," and "in statistical terms, the performance … is indistinguishable from … buy-and-hold." This is the single most important realism check for the trend leg: **the design must trade on the *next* bar's open/close after the signal, never the signal bar itself.**
+
+**Dual momentum (Antonacci).** Gary Antonacci, "Risk Premia Harvesting Through Dual Momentum" (SSRN 2042750; *Journal of Management & Entrepreneurship* 2017), combines absolute momentum (own 12-month excess return vs T-bills — a trend filter) with relative momentum (US vs ex-US equities). He shows "both absolute and relative momentum can enhance returns, but … absolute momentum does far more to lessen volatility and drawdown." For a single-index long-only trend leg, absolute (time-series) momentum is the directly relevant ingredient.
+
+**Growth-Trend Timing (Philosophical Economics).** The "Growth-Trend Timing" framework combines the 10-month SMA with recession filters (e.g., unemployment trend, industrial production), only "turning on" the moving-average exit when economic data signal recession risk — dramatically reducing whipsaws in non-recessionary corrections. AllocateSmartly's backtest from 1930 confirms GTT "maintains returns while managing losses" and increases time in market. This is a well-regarded refinement to reduce the whipsaw cost that plagues naïve MA rules.
+
+**Recent regime performance.** MA/trend rules on the S&P whipsawed in 2015, 2018, and to some extent around the fast 2020 COVID crash (a monthly rule exits late and re-enters late on a V-recovery). In 2022, however, a slow bear market, monthly trend exits added value. Diversified *managed-futures* trend had a banner 2022: per Société Générale's 2022 CTA performance report, the SG Trend Index was the best overall performer at +27.3%, but its gains came "predominantly from downward trends in bond and interest rate markets, and upward trends in US dollar and energy markets," while "movements in Equity indices, Livestock, and Softs were harder to capture and contributed small losses." The lesson: single-index equity trend is a blunt instrument whose payoff is lumpy and crisis-dependent — the diversified-CTA numbers are not achievable from an S&P-only trend rule.
+
+### B. Short-Term Mean Reversion — the evidence
+
+**Academic base.** Short-horizon reversal was documented by Jegadeesh, "Evidence of Predictable Behavior of Security Returns," *Journal of Finance* 45(3), 1990, 881–898, and Lehmann, "Fads, Martingales, and Market Efficiency," *Quarterly Journal of Economics* 105(1), 1990, 1–28. Jegadeesh found a monthly reversal strategy earned ~2% per month (1934–1987); Lehmann found weekly contrarian profits. These are *cross-sectional* stock reversals driven partly by liquidity provision and bid-ask bounce; profits shrink substantially after transaction costs and have declined over time (Della Corte & Kosowski and others note the effect is weak/absent in futures at the index level). So the academic reversal literature *motivates* index mean-reversion but does not directly prove a tradable index edge.
+
+**The regime shift to index mean reversion.** Multiple sources document that S&P 500 short-horizon autocorrelation flipped from positive (momentum) before the mid-1990s to negative (mean-reverting) afterward. Price Action Lab's analysis shows 1-lag 252-day daily-return autocorrelation was strongly positive from 1940 to the mid-1990s then turned negative, reaching roughly −0.40 after the March 2020 crash. This regime shift is *why* buy-the-dip strategies on SPY have worked since the 1990s and is central to the strategy's premise.
+
+**Connors/Alvarez systems (practitioner, published).** Larry Connors & Cesar Alvarez, *Short Term Trading Strategies That Work* (2008), published concrete rules and backtests:
+- **RSI(2):** Long when price > 200-day SMA and 2-period RSI < 10 (or < 5 for a stronger edge); exit when price closes above the 5-day SMA. Their published S&P example (2-period RSI < 5, 1995–2007): 49 signals, 83.6% "correct," average hold ~3 days.
+- **Cumulative RSI, Double 7's, and a VIX-stretch rule** (buy when VIX ≥ 5% above its 10-day MA). Reported win rates 75–88% on SPY.
+- Connors' controversial findings: **"stops hurt"** on index mean-reversion (they exit before the snapback), and **holding overnight adds edge.**
+- On the short side, Connors/Alvarez and Alvarez's later writing note shorts "are better *over* the 200-day moving average than below" and require *more extreme* overbought readings (e.g., RSI(2) > 95 or even > 99) — a critical nuance that contradicts the naïve "mirror the long rules below the 200-day" approach.
+
+**Internal Bar Strength (IBS).** IBS = (Close − Low) / (High − Low). Alexander Soffronow Pagonidis, "The IBS Effect: Mean Reversion in Equity ETFs" (2013, NAAIM), found for equity index ETFs "average returns when IBS is below 0.20 are .35% while average returns when IBS is above 0.80 are -0.13%," with bottom-bucket days "statistically significantly different from the average day at the 1% confidence level." Low-IBS days are also followed by positively skewed returns. IBS is one of the simplest, most robust index mean-reversion signals, though commissions materially erode a standalone IBS system.
+
+**Honest assessment of standalone MR returns.** Independent backtests (e.g., Trade2Win, QuantifiedStrategies) confirm RSI(2) and IBS "continue to perform well" out-of-sample with high win rates, but note the *annualized return is poor* because trades are infrequent and capital sits idle — so these are best as *components in a basket*, not standalone systems. Adding a stop-loss on the long side generally *worsened* results (confirming Connors).
+
+### C. Combining the Two Legs
+
+**Complementarity is structural, not coincidental.** Trend-following is a *divergent* style (positive skew, win rate < 50%, rides outliers); mean-reversion is a *convergent* style (high win rate, negative skew, small quick profits). Price Action Lab's tests (using the same base algorithm in divergent vs convergent modes to minimize data-mining) found the two equity curves have an average rolling correlation of about −0.05, and an equal-weight combination raised the Sharpe to 0.91 from ~0.65. Practitioner consensus (echoing Ray Dalio's "Holy Grail" of uncorrelated return streams) is that trend and reversion "underperform in different conditions": trend gets chopped up in range-bound markets (2011–2012) while mean-reversion gets run over in strong trends (2020–2021).
+
+BacktestWizard's specific SPY-trend + QQQ-IBS test found combining a trend leg with a mean-reversion leg improved risk-adjusted returns (CAR/MDD), with allocations like 30% trend / 70% MR tested and monthly rebalancing of the trend position.
+
+**Regime detection for weekly-monthly cadence.** Options with literature support:
+- **200-day MA slope / level** — the simplest, most robust regime gate (Connors, Alvarez), and the natural switch for allocating long-only MR above the line and (optionally) short MR below.
+- **Volatility regimes / VIX** — Connors' VIX-stretch rule; Nagel (2012) shows short-term reversal profits are predictable by VIX (reversion pays more when volatility/illiquidity is high). Mean-reversion systems "perform best during volatile markets."
+- **Hidden Markov Models** — Yuan & Mitra, "Market Regime Identification Using Hidden Markov Models" (SSRN 3406068); Oelschläger & Adam (2020, arXiv 2007.14874) apply hierarchical HMMs to the S&P and DAX. HMMs are powerful but add estimation risk and overfitting potential; for a weekly-monthly retail cadence they are optional sophistication, not necessity.
+
+**Position sizing and volatility targeting.** Moreira & Muir, "Volatility-Managed Portfolios," *Journal of Finance* 72(4), 2017, 1611–1644 (SSRN 2659431), show scaling exposure inversely to recent realized variance "produce[s] large alphas, increase[s] Sharpe ratios" across the market and many factors. However, Cederburg, O'Doherty, Wang et al. (*JFE* 2020) show the real-time, out-of-sample versions "generally earn lower certainty equivalent returns and Sharpe ratios than … the original unmanaged portfolios" — so use volatility targeting as a *risk-control* tool (targeting a constant ~10–15% annualized vol), not a guaranteed alpha source. Time-series-momentum literature (Baltas & Kosowski; Harvey et al. "Impact of Volatility Targeting," SSRN 3175538) supports volatility scaling for smoothing trend returns.
+
+### D. Practical Implementation: ES/MES vs SPY
+
+**Tax.** ES and MES (Micro E-mini) are Section 1256 contracts: gains are taxed 60% long-term / 40% short-term *regardless of holding period*. Per Green Trader Tax, "at the maximum tax bracket for 2025 and 2026, the blended 60/40 rate is 26.8% — 10.2% lower than the highest regular bracket of 37%" — a decisive advantage over short-term SPY gains (adding the 3.8% NIIT, the top-bracket blended rate is ~30.6% for futures vs ~40.8% on short-term stock gains). Section 1256 positions are marked-to-market at year-end and there is no wash-sale complication. Note SPY *options* do NOT qualify (they are equity options); only the futures do.
+
+**Capital efficiency & shorting.** Futures are self-financed and require only margin (~5–12% initial), giving leverage and freeing cash to earn T-bill yield. Shorting futures has *no borrow fee and no uptick/locate friction* — a decisive advantage for the short mean-reversion leg vs shorting SPY (which incurs borrow cost and margin rules). No PDT rule applies to futures.
+
+**Sizing granularity.** ES multiplier is $50/point (~$300k+ notional at current index levels); MES is $5/point (1/10th), tick value $1.25 vs ES $12.50. MES lets small accounts size precisely and scale (10 MES = 1 ES). Micros are now a major share of index-futures activity: per CME Group's monthly volume report, Micro E-mini equity-index futures and options averaged 4 million contracts/day in November 2025 — 45.3% of overall CME equity-index ADV.
+
+**Roll mechanics.** ES/MES are quarterly (Mar/Jun/Sep/Dec, codes H/M/U/Z); roll to the next front month during the week before the third Friday, typically as a calendar spread. This is minor operational overhead for a swing trader.
+
+**Transaction costs & slippage.** ES is among the most liquid instruments in the world, with a bid-ask spread that is "almost always one tick" ($12.50) during regular hours. Round-trip commissions are a few dollars per ES contract. Slippage for swing-cadence orders is negligible on ES; MES spreads can widen slightly overnight. SPY is also extremely liquid (penny spreads) but lacks the tax and shorting advantages. For monthly/weekly signals, execute at the *next* open or close after a signal computed on the close.
+
+### E. Concrete Proposed Strategy Blueprint
+
+This synthesizes the literature into a decision-ready design. Treat all numbers as *planning estimates* subject to out-of-sample decay.
+
+**Instruments:** MES (or ES) for both legs; MES for granular sizing. Compute signals on the cash S&P 500 / SPY closing series for clean indicator history; execute in MES.
+
+**Leg 1 — Long-only trend (core, ~60–70% of risk budget):**
+- **Signal:** At each month-end, go long if S&P close > 10-month SMA (equivalently 200-day SMA) AND/OR 12-month total return > 0; otherwise flat (cash/T-bills). Optionally overlay Growth-Trend Timing: stay long whenever recession filters are benign, only activate the MA-exit when unemployment trend / industrial production deteriorate — this cuts whipsaws.
+- **Execution:** Trade next session's open/close (never the signal bar — avoids Zakamulin look-ahead bias).
+- **Expected characteristics (from published backtests, gross):** roughly buy-and-hold-like compound return, ~30% lower volatility, max drawdown reduced from ~−50% to ~−20–35% in good cases — but expect only a modest Sharpe improvement net of costs (Zakamulin: realistic edge ~7–10% and statistically indistinguishable, not 50–100%), and multi-year periods of underperformance in bull markets.
+
+**Leg 2 — Long/short mean reversion (satellite, ~30–40% of risk budget):**
+- **Long setup (durable edge):** When S&P > 200-day SMA and RSI(2) < 10 (aggressive: < 5) OR IBS < 0.2 → buy next session. Exit when close > 5-day SMA (or RSI(2) > 60–70). No hard stop (Connors: stops hurt); use the 200-day MA break as a structural exit and cap position size instead.
+- **Short setup (fragile, optional):** Only consider shorts when RSI(2) > 95 (ideally > 99) and price is *extended above* a rising 200-day MA (per Alvarez), or in a confirmed downtrend with extreme overbought bounces; keep size small; accept high left-tail (squeeze) risk. Given the equity drift and short-squeeze danger, treat the short leg as *optional alpha* — many practitioners run this system long-only or trade shorts only in elevated-VIX regimes.
+- **Published stats (context):** RSI(2)<5 on S&P: ~83.6% win rate, ~3-day holds (Connors, 1995–2007); IBS<0.2 next-day +0.35% average (Pagonidis). Standalone annualized returns are low; value comes from combination.
+
+**Capital allocation & risk management:**
+- Volatility-target the *whole portfolio* to ~10–15% annualized realized vol (Moreira & Muir spirit, used for risk control not alpha), scaling total MES contracts up/down as trailing realized vol falls/rises.
+- Cap gross exposure (e.g., ≤1.5–2× notional even with futures leverage) and cap the MR leg's simultaneous exposure (Connors signals cluster in selloffs — limit to avoid correlated blowups).
+- Rebalance the trend leg monthly; run MR signals daily but with swing (days-long) holds — consistent with the user's weekly-to-monthly comfort.
+- Optionally scale trend exposure by trend strength (distance above MA) and MR size by depth of oversold reading.
+
+**Caveats on the blueprint:** The long trend leg and long MR leg are the robust, literature-supported core. The short MR leg is the fragile piece most likely to fail live. Every published win rate above will degrade out-of-sample.
+
+## Recommendations
+
+1. **Build and paper-trade the two long legs first** (long-only trend + long-only mean-reversion above the 200-day MA). This is the highest-conviction, most-robust core. Benchmark against SPY buy-and-hold on Sharpe, max drawdown, and CAR/MDD — not raw return.
+2. **Use MES, not SPY,** for tax efficiency (Section 1256), capital efficiency, and costless shorting. Start at 1–2 MES per unit of risk and scale only after consistent execution. Keep ≥$5,000 buffer per MES to survive drawdowns.
+3. **Enforce next-bar execution** on all signals to eliminate look-ahead bias — the single most common reason backtests fail live (Zakamulin/Glabadanidis).
+4. **Add the short mean-reversion leg only after** the long system is running cleanly, and only with: extreme overbought thresholds (RSI(2) > 95–99), small size, VIX/regime gating, and full acceptance of short-squeeze tail risk. **Threshold to abandon shorts:** if the short leg's live contribution to portfolio return is negative or its drawdowns exceed its trailing 12-month P&L, cut it.
+5. **Validate with walk-forward / out-of-sample testing,** not a single in-sample backtest. Reserve the last several years as holdout; expect published/backtested Sharpes to degrade 30–50%+. Assume 0.5% one-way cost in stock-equivalent terms when stress-testing (Zakamulin's assumption), even though futures costs are lower, as a conservatism buffer.
+6. **Layer regime detection incrementally:** start with the 200-day MA gate (robust), optionally add a VIX filter for the MR leg, and only consider HMMs if you have the tooling and discipline to avoid overfitting.
+7. **Volatility-target the combined portfolio to ~10–15%** for a smoother equity curve; do not rely on volatility management for alpha (it decays out-of-sample).
+8. **Benchmarks that would change the plan:** If the combined system's out-of-sample Sharpe does not exceed SPY buy-and-hold's by a meaningful margin (say, >0.2 Sharpe) after realistic costs, simplify back to the trend leg alone or reconsider. If realized correlation between the two legs rises persistently above ~0.3, the diversification premise is weakening — re-examine.
+
+## Caveats
+
+- **Single-index equity trend ≠ diversified managed futures.** The century-of-evidence Sharpe ratios come from multi-asset portfolios. On the S&P alone, trend-following mainly cuts drawdowns and will underperform buy-and-hold in sustained bulls, sometimes for years. The SG Trend Index's +27.3% in 2022 came from bonds, currencies, and energy — not equities.
+- **Published backtest numbers are overstated.** Zakamulin's out-of-sample, cost-adjusted work shows MA-timing's real-life Sharpe edge is ~7–10% (and statistically indistinguishable from buy-and-hold), not 50–100%, and capital growth can be lower than buy-and-hold; the Glabadanidis episode shows how look-ahead bias inflates results. Connors' 75–88% win rates come from favorable in-sample periods and specific instruments.
+- **The short side is structurally disadvantaged** by equity drift and asymmetric squeeze risk; treat it as optional.
+- **Out-of-sample decay is the norm.** Widely-published strategies (RSI(2), Faber SMA) are now well-known; edges can crowd and shrink. The mean-reversion regime itself (negative autocorrelation) is a *historical* feature that has weakened at times (e.g., autocorrelation returned toward neutral in 2021) and could shift again.
+- **Whipsaw and tax friction:** monthly trend rules whipsaw in choppy years (2015, 2018); frequent MR trading generates many short-term events (mitigated by Section 1256 for futures, but not for SPY).
+- **This is research synthesis, not individualized investment advice.** State tax treatment varies (e.g., California taxes all gains as ordinary income, negating the 60/40 benefit). Consult a tax professional. Backtest independently before committing capital.

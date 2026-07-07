@@ -232,10 +232,12 @@ class RegimeStressTest:
         """Classify bars into low/medium/high volatility regimes."""
         returns = data["close"].pct_change()
         rolling_vol = returns.rolling(20).std()
-        terciles = rolling_vol.quantile([0.33, 0.66])
+        # Expanding quantiles: threshold at bar t uses only bars 0..t, no future data.
+        q33 = rolling_vol.expanding(min_periods=20).quantile(0.33)
+        q66 = rolling_vol.expanding(min_periods=20).quantile(0.66)
         labels = pd.Series("medium", index=data.index)
-        labels[rolling_vol <= terciles.iloc[0]] = "low_vol"
-        labels[rolling_vol >= terciles.iloc[1]] = "high_vol"
+        labels[rolling_vol <= q33] = "low_vol"
+        labels[rolling_vol >= q66] = "high_vol"
         return labels
 
     @staticmethod

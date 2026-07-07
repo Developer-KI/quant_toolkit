@@ -1,4 +1,4 @@
-from .splits import HoldoutSplit, WalkForwardSplits, Split
+from .splits import HoldoutSplit, WalkForwardSplits, Split, TTVSplit, TrainTestValidateSplit
 from .tests import (
     TestResult,
     HypothesisTests,
@@ -16,7 +16,7 @@ from .overfitting import (
 
 __all__ = [
     # Splits
-    "HoldoutSplit", "WalkForwardSplits", "Split",
+    "HoldoutSplit", "WalkForwardSplits", "Split", "TTVSplit", "TrainTestValidateSplit",
     # Tests
     "TestResult", "HypothesisTests", "PermutationTest", "BootstrapCI", "report",
     # Walk-forward

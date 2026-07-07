@@ -122,6 +122,18 @@ class BacktestResult:
         dd = (eq - peak) / peak
         max_dd = dd.min()
 
+        underwater = dd < 0
+        pct_time_underwater = float(underwater.mean() * 100)
+        uw_arr = underwater.values
+        if uw_arr.any():
+            transitions = np.diff(uw_arr.astype(np.int8), prepend=0, append=0)
+            lengths = np.where(transitions == -1)[0] - np.where(transitions == 1)[0]
+            max_time_underwater_bars = int(lengths.max())
+            avg_time_underwater_bars = float(lengths.mean())
+        else:
+            max_time_underwater_bars = 0
+            avg_time_underwater_bars = 0.0
+
         if len(tdf) > 0 and "pnl" in tdf.columns:
             wins = (tdf["pnl"] > 0).sum()
             win_rate = wins / len(tdf)
@@ -156,6 +168,9 @@ class BacktestResult:
             "sortino_ratio": round(sortino, 4),
             "calmar_ratio": round(calmar, 4),
             "max_drawdown_pct": round(max_dd * 100, 4),
+            "pct_time_underwater": round(pct_time_underwater, 2),
+            "max_time_underwater_bars": max_time_underwater_bars,
+            "avg_time_underwater_bars": round(avg_time_underwater_bars, 1),
             "num_trades": len(tdf),
             "win_rate_pct": round(win_rate * 100, 2),
             "avg_win": round(avg_win, 4),

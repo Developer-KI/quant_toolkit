@@ -201,3 +201,142 @@ class WalkForwardSplits:
 
         else:
             raise ValueError(f"Unknown method: {self.method!r}. Use 'expanding' or 'rolling'.")
+
+
+@dataclass
+class TTVSplit:
+    """
+    Three-way temporal split: train / test / validate.
+
+    Train   — strategy design and IS exploration (do NOT run hypothesis tests here).
+    Test    — parameter optimisation (param sweeps); results may inform design.
+    Validate— single blind evaluation; all hypothesis tests and performance claims go here.
+    """
+
+    train: Universe
+    test: Universe
+    validate: Universe
+    train_start: pd.Timestamp
+    train_end: pd.Timestamp
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    validate_start: pd.Timestamp
+    validate_end: pd.Timestamp
+
+    def __repr__(self) -> str:
+        return (
+            f"TTVSplit("
+            f"train={self.train_start.date()}→{self.train_end.date()}, "
+            f"test={self.test_start.date()}→{self.test_end.date()}, "
+            f"validate={self.validate_start.date()}→{self.validate_end.date()})"
+        )
+
+
+class TrainTestValidateSplit:
+    """
+    Build a three-way temporal split from a Universe.
+
+    Usage (fractions):
+        ttv = TrainTestValidateSplit.by_fractions(universe, train_frac=0.6, test_frac=0.2)
+
+    Usage (dates):
+        ttv = TrainTestValidateSplit.by_dates(
+            universe, test_start="2015-01-01", validate_start="2019-01-01"
+        )
+
+    embargo_bars: bars dropped from the *start* of each new segment to prevent
+    slow-indicator leakage (e.g. a 200-bar EMA still encoding train data at bar 1
+    of the test window).  The default of 0 is safe when indicators are recomputed
+    fresh per segment; set to your longest indicator period otherwise.
+    """
+
+    @staticmethod
+    def by_fractions(
+        universe: Universe,
+        train_frac: float = 0.60,
+        test_frac: float = 0.20,
+        embargo_bars: int = 0,
+    ) -> TTVSplit:
+        if train_frac <= 0 or test_frac <= 0 or train_frac + test_frac >= 1.0:
+            raise ValueError(
+                f"train_frac ({train_frac}) and test_frac ({test_frac}) must both be "
+                "positive and sum to less than 1.0."
+            )
+
+        ref = universe.ohlcv(universe.symbols[0])
+        idx = ref.index
+        n = len(idx)
+
+        train_end_pos = int(n * train_frac)
+        test_start_pos = train_end_pos + embargo_bars
+        test_end_pos = int(n * (train_frac + test_frac))
+        validate_start_pos = test_end_pos + embargo_bars
+
+        if test_start_pos >= test_end_pos:
+            raise ValueError("Test segment is empty after applying embargo_bars.")
+        if validate_start_pos >= n:
+            raise ValueError("Validate segment is empty after applying embargo_bars.")
+
+        train_idx = idx[:train_end_pos]
+        test_idx = idx[test_start_pos:test_end_pos]
+        validate_idx = idx[validate_start_pos:]
+
+        return TTVSplit(
+            train=_slice_universe(universe, train_idx),
+            test=_slice_universe(universe, test_idx),
+            validate=_slice_universe(universe, validate_idx),
+            train_start=train_idx[0],
+            train_end=train_idx[-1],
+            test_start=test_idx[0],
+            test_end=test_idx[-1],
+            validate_start=validate_idx[0],
+            validate_end=validate_idx[-1],
+        )
+
+    @staticmethod
+    def by_dates(
+        universe: Universe,
+        test_start: str | pd.Timestamp,
+        validate_start: str | pd.Timestamp,
+        embargo_bars: int = 0,
+    ) -> TTVSplit:
+        ts_test = pd.Timestamp(test_start)
+        ts_val = pd.Timestamp(validate_start)
+        if ts_test >= ts_val:
+            raise ValueError("test_start must be before validate_start.")
+
+        ref = universe.ohlcv(universe.symbols[0])
+        idx = ref.index
+
+        # Locate boundary positions by date
+        test_pos = idx.searchsorted(ts_test)
+        val_pos = idx.searchsorted(ts_val)
+
+        train_idx = idx[:test_pos]
+        test_idx = idx[test_pos + embargo_bars : val_pos]
+        validate_idx = idx[val_pos + embargo_bars :]
+
+        if train_idx.empty:
+            raise ValueError("Train segment is empty — move test_start forward.")
+        if test_idx.empty:
+            raise ValueError(
+                "Test segment is empty after applying embargo_bars — "
+                "widen the test window or reduce embargo_bars."
+            )
+        if validate_idx.empty:
+            raise ValueError(
+                "Validate segment is empty after applying embargo_bars — "
+                "move validate_start earlier or reduce embargo_bars."
+            )
+
+        return TTVSplit(
+            train=_slice_universe(universe, train_idx),
+            test=_slice_universe(universe, test_idx),
+            validate=_slice_universe(universe, validate_idx),
+            train_start=train_idx[0],
+            train_end=train_idx[-1],
+            test_start=test_idx[0],
+            test_end=test_idx[-1],
+            validate_start=validate_idx[0],
+            validate_end=validate_idx[-1],
+        )
