@@ -6,6 +6,7 @@ logs/
 build/
 /data
 /research
+/skills
 
 **/p_* 
 *.png
