@@ -1,6 +1,6 @@
 # Quantitative Trading Framework
 
-A modular, production-ready Python framework for developing, backtesting, stress-testing, and live-trading quantitative strategies across crypto perpetual futures, spot markets, and US equities.
+A modular, production-ready Python framework for developing, backtesting, stress-testing, and live-trading quantitative strategies.
 
 ---
 
@@ -10,7 +10,7 @@ I'm Kiril Ivanov — a quant developer building systematic trading infrastructur
 
 My focus is on **doing things right**: clean dependency graphs, protocol-driven interfaces, statistically sound backtest methodology (no look-ahead, proper train/test/validate splits, deflated Sharpe ratio), and code that is easy to extend without being over-engineered.
 
-**Links:** [GitHub](https://github.com/Kiril-Ivanov) · [ivanov.r.kiril@abv.bg](mailto:ivanov.r.kiril@abv.bg)
+**Links:** [ivanov.r.kiril@abv.bg](mailto:ivanov.r.kiril@abv.bg)
 
 ---
 
