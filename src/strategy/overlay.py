@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import abc
 
-from core.models import Side
-from .base import Allocation, CrossExchangeContext, MultiExchangeTarget
+from core.models import Side, Allocation
+from .base import StrategyContext, PortfolioTarget
+
 
 class PortfolioOverlay(abc.ABC):
     """
     Post-strategy risk filter for cross-exchange constraints.
 
-    Sits between strategy output and execution.  After each bar:
-      1. Per-exchange strategies generate their PortfolioTargets
-      2. Targets are merged into a MultiExchangeTarget
-      3. The overlay adjusts the merged target (scale, veto, hedge)
-      4. Engine executes the adjusted target
+    After each bar:
+      1. Strategy generates a PortfolioTarget (with exchange_allocations populated
+         for multi-exchange strategies)
+      2. The overlay adjusts the target (scale, veto, hedge)
+      3. Engine executes the adjusted target
 
     Use cases:
       • Cap net exposure across exchanges
@@ -25,9 +26,9 @@ class PortfolioOverlay(abc.ABC):
     @abc.abstractmethod
     def adjust(
         self,
-        target: MultiExchangeTarget,
-        ctx: CrossExchangeContext,
-    ) -> MultiExchangeTarget:
+        target: PortfolioTarget,
+        ctx: StrategyContext,
+    ) -> PortfolioTarget:
         """
         Adjust allocations for cross-exchange constraints.
         Return the (possibly modified) target.
@@ -51,9 +52,9 @@ class NetExposureOverlay(PortfolioOverlay):
     def __init__(self, max_net_weight: float = 0.5):
         self.max_net_weight = max_net_weight
 
-    def adjust(self, target, ctx):
+    def adjust(self, target: PortfolioTarget, ctx: StrategyContext) -> PortfolioTarget:
         net_weight_by_symbol: dict[str, float] = {}
-        for (ex, sym), alloc in target.allocations.items():
+        for (ex, sym), alloc in target.exchange_allocations.items():
             direction = 1 if alloc.side == Side.LONG else (
                 -1 if alloc.side == Side.SHORT else 0
             )
@@ -64,7 +65,7 @@ class NetExposureOverlay(PortfolioOverlay):
         for sym, net_w in net_weight_by_symbol.items():
             if abs(net_w) > self.max_net_weight and abs(net_w) > 0:
                 scale = self.max_net_weight / abs(net_w)
-                for (ex, s), alloc in target.allocations.items():
+                for (ex, s), alloc in target.exchange_allocations.items():
                     if s == sym and alloc.side != Side.FLAT:
                         alloc.weight *= scale
 
@@ -75,7 +76,7 @@ class DeltaNeutralOverlay(PortfolioOverlay):
     """
     Enforce delta-neutral positioning per symbol.
 
-    If after all strategies run, a symbol has net directional exposure,
+    If after all strategies run a symbol has net directional exposure,
     this overlay adds a counter-position on a specified hedge exchange.
     """
 
@@ -83,9 +84,9 @@ class DeltaNeutralOverlay(PortfolioOverlay):
         self.hedge_exchange = hedge_exchange
         self.max_residual_weight = max_residual_weight
 
-    def adjust(self, target, ctx):
+    def adjust(self, target: PortfolioTarget, ctx: StrategyContext) -> PortfolioTarget:
         net_by_symbol: dict[str, float] = {}
-        for (ex, sym), alloc in target.allocations.items():
+        for (ex, sym), alloc in target.exchange_allocations.items():
             if alloc.side == Side.FLAT:
                 continue
             direction = 1 if alloc.side == Side.LONG else -1

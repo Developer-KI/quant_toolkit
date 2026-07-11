@@ -40,9 +40,6 @@ from strategy.base import (
     Strategy,
     StrategyContext,
     PortfolioTarget,
-    CrossExchangeStrategy,
-    CrossExchangeContext,
-    MultiExchangeTarget,
 )
 from core.universe import Universe
 from strategy.overlay import PortfolioOverlay
@@ -72,7 +69,7 @@ class Engine:
     def __init__(
         self,
         strategy: Strategy | None = None,
-        cross_strategy: CrossExchangeStrategy | None = None,
+        cross_strategy: Strategy | None = None,
         per_exchange_strategies: dict[str, Strategy] | None = None,
         overlay: PortfolioOverlay | None = None,
         config: LiveConfig | None = None,
@@ -483,12 +480,12 @@ class Engine:
 
     def _generate_targets(
         self, trigger_exchange, trigger_symbol, ts, all_positions
-    ) -> MultiExchangeTarget | None:
+    ) -> PortfolioTarget | None:
         if self._mode == "cross":
             return self._generate_cross(ts, all_positions)
         return self._generate_per_exchange(trigger_exchange, ts, all_positions)
 
-    def _generate_cross(self, ts, all_positions) -> MultiExchangeTarget | None:
+    def _generate_cross(self, ts, all_positions) -> PortfolioTarget | None:
         try:
             self.cross_strategy.setup(self._universes)
         except Exception as e:
@@ -499,7 +496,7 @@ class Engine:
 
     def _generate_per_exchange(
         self, trigger_exchange, ts, all_positions
-    ) -> MultiExchangeTarget | None:
+    ) -> PortfolioTarget | None:
         per_exchange_targets: dict[str, PortfolioTarget] = {}
         for ex_name, strat in self._per_exchange_strategies.items():
             universe = self._universes.get(ex_name)
@@ -523,9 +520,9 @@ class Engine:
                 trade_history=self.state.closed_trades,
             )
             per_exchange_targets[ex_name] = strat.generate(ctx)
-        return MultiExchangeTarget.from_per_exchange(per_exchange_targets)
+        return PortfolioTarget.from_exchange_targets(per_exchange_targets)
 
-    def _build_cross_ctx(self, ts, all_positions) -> CrossExchangeContext:
+    def _build_cross_ctx(self, ts, all_positions) -> StrategyContext:
         bar_idx = 0
         for u in self._universes.values():
             for sym in self._symbols:
@@ -533,17 +530,18 @@ class Engine:
                     bar_idx = max(bar_idx, len(u.ohlcv(sym)) - 1)
                 except KeyError:
                     pass
-        return CrossExchangeContext(
-            universes=self._universes, bar_idx=bar_idx, timestamp=ts,
-            total_equity=self.portfolio.total_equity(),
+        return StrategyContext(
+            universes=self._universes,
+            bar_idx=bar_idx,
+            timestamp=ts,
             equity_by_exchange=self.portfolio.equity_breakdown(),
-            positions=all_positions, portfolio=self.portfolio,
+            all_positions=all_positions,
             trade_history=self.state.closed_trades,
         )
 
     # ── Execution ─────────────────────────────────────────────────────────
 
-    def _execute_target(self, target: MultiExchangeTarget, ts, all_positions):
+    def _execute_target(self, target: PortfolioTarget, ts, all_positions):
         # Phase 1: closes
         for ex_name in self._exchange_names:
             executor = self._executors[ex_name]
@@ -680,9 +678,9 @@ class Engine:
                     self.state.daily_trades += 1
 
                     if self._mode == "cross" and self.cross_strategy:
-                        self.cross_strategy.on_fill(ex_name, sym, alloc.side, fill.filled_size or size, fill.fill_price or price)
+                        self.cross_strategy.on_fill(sym, alloc.side, fill.filled_size or size, fill.fill_price or price, exchange=ex_name)
                     elif ex_name in self._per_exchange_strategies:
-                        self._per_exchange_strategies[ex_name].on_fill(sym, alloc.side, fill.filled_size or size, fill.fill_price or price)
+                        self._per_exchange_strategies[ex_name].on_fill(sym, alloc.side, fill.filled_size or size, fill.fill_price or price, exchange=ex_name)
 
     # ── Execution helpers ─────────────────────────────────────────────────
 

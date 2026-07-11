@@ -2,7 +2,7 @@
 strategy/ — Unified trading strategy framework.
 
 Modules:
-    base.py        — Allocation, PortfolioTarget, Strategy
+    base.py        — Allocation, PortfolioTarget, Strategy, StrategyContext
     built_in.py    — SingleAssetStrategy, CompositeStrategy, PerAssetStrategy, and multi-asset built-ins
     indicators.py  — Stateless indicator functions (EMA, RSI, ATR, …)
     sizing.py      — Position sizing (Sizer hierarchy)
@@ -29,13 +29,6 @@ from .base import (
     register_strategy,
     get_strategy,
     list_strategies,
-    # Cross-exchange
-    MultiExchangeTarget,
-    CrossExchangeContext,
-    CrossExchangeStrategy,
-    register_cross_strategy,
-    get_cross_strategy,
-    list_cross_strategies,
 )
 
 # ── Built-in strategies ──────────────────────────────────────────────────────
@@ -44,8 +37,6 @@ from .built_in import (
     SingleAssetStrategy,
     CompositeStrategy,
     PerAssetStrategy,
-    ZPairsSpreadStrategy,
-    CrossAssetMomentumStrategy,
     MeanReversionBasketStrategy,
 )
 
@@ -120,12 +111,8 @@ __all__ = [
     "Allocation", "PortfolioTarget", "StrategyContext",
     "Strategy", "SingleAssetStrategy",
     "register_strategy", "get_strategy", "list_strategies",
-    # Cross-exchange strategy
-    "MultiExchangeTarget", "CrossExchangeContext", "CrossExchangeStrategy",
-    "register_cross_strategy", "get_cross_strategy", "list_cross_strategies",
     # Built-in strategies
     "CompositeStrategy", "PerAssetStrategy",
-    "ZPairsSpreadStrategy", "CrossAssetMomentumStrategy",
     "MeanReversionBasketStrategy",
     # Sizing
     "Sizer", "SizingContext",

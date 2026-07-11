@@ -44,7 +44,7 @@ from strategy.stops import (
     default_stop_loss,
 )
 
-from strategy.base import Strategy, StrategyContext
+from strategy.base import Strategy, StrategyContext, PortfolioTarget
 from core.universe import Universe
 
 
@@ -76,6 +76,8 @@ class BacktestResult:
     # ── multi-asset extras (None when single-asset) ──────────────────────
     positions_log: pd.DataFrame | None = None       # per-bar, per-asset positions
     allocation_log: pd.DataFrame | None = None      # per-bar, per-asset allocations
+    # ── multi-exchange extras (None when single-exchange) ─────────────────
+    equity_curves_by_exchange: dict[str, pd.Series] | None = None
 
     # ── export helpers ───────────────────────────────────────────────────
 
@@ -187,6 +189,11 @@ class BacktestResult:
                 tdf["meta_symbol"].unique()
             ) if "meta_symbol" in tdf.columns else symbols
 
+        # Extra field for multi-exchange
+        exchanges = self.meta.get("exchanges")
+        if exchanges:
+            result["exchanges"] = exchanges
+
         return result
 
     def plot_equity(self, save_path: str | None = None, show: bool = False):
@@ -283,6 +290,11 @@ class BacktestResult:
         self.to_csv(run_dir / "trades.csv")
         self.plot_equity(save_path=run_dir / "equity_curve.png")
 
+        if self.equity_curves_by_exchange:
+            ex_df = pd.DataFrame(self.equity_curves_by_exchange)
+            ex_df.index.name = "timestamp"
+            ex_df.to_csv(run_dir / "equity_curves_by_exchange.csv")
+
         return str(run_dir)
 
 
@@ -322,6 +334,8 @@ class Backtester:
         sizer: Sizer | dict[str, Sizer] | None = None,
         stop_loss: StopLoss | dict[str, StopLoss] | None = None,
         symbol: str | None = None,
+        exchange_costs: dict[str, CostModel] | None = None,
+        capital_by_exchange: dict[str, float] | None = None,
     ):
         self.config = config or BacktestConfig()
         self._cost_model_spec = cost_model
@@ -329,6 +343,8 @@ class Backtester:
         self._stop_loss_spec = stop_loss
         self._strategy = strategy
         self._default_symbol = symbol or "ASSET"
+        self._exchange_costs = exchange_costs or {}
+        self._capital_by_exchange = capital_by_exchange
 
     # ── Component resolution ─────────────────────────────────────────────
 
@@ -347,35 +363,46 @@ class Backtester:
         l2: list[OrderBookSnapshot] | None = None,
         universe: Universe | None = None,
         timeframe: str | None = None,
+        universes: dict[str, Universe] | None = None,
     ) -> BacktestResult:
         """
         Run backtest.
 
         Old API:  result = bt.run(data=df, l2=snapshots)
         New API:  result = bt.run(universe=universe, timeframe="1h")
+        Multi-exchange: result = bt.run(universes={"binance": u1, "kraken": u2})
 
         timeframe — bar size label (e.g. "1m", "5m", "1h", "1d").
                     Used to compute the annualisation factor for Sharpe/vol metrics.
                     When omitted the factor is inferred from the bar index spacing.
         """
-        if data is not None and universe is not None:
-            raise ValueError("Provide data= or universe=, not both")
+        n_sources = sum(x is not None for x in (data, universe, universes))
+        if n_sources > 1:
+            raise ValueError("Provide exactly one of data=, universe=, or universes=")
+
+        if universes is not None:
+            if len(universes) == 1:
+                # Single-exchange dict: unwrap and use the normal path
+                universe = next(iter(universes.values()))
+            else:
+                return self._run_loop_multi_exchange(
+                    strategy=self._strategy,
+                    universes=universes,
+                    timeframe=timeframe,
+                )
 
         if data is not None:
             sym = self._default_symbol
             universe = Universe(symbols=[sym])
             universe.add_asset(sym, data, l2=l2)
-            strategy = self._strategy
-        elif universe is not None:
-            strategy = self._strategy
-        else:
-            raise ValueError("Provide either data= or universe=")
+        elif universe is None:
+            raise ValueError("Provide either data=, universe=, or universes=")
 
         symbols = universe.symbols
         is_single_asset = len(symbols) == 1
 
         return self._run_loop(
-            strategy=strategy,
+            strategy=self._strategy,
             universe=universe,
             symbols=symbols,
             is_single_asset=is_single_asset,
@@ -1123,4 +1150,495 @@ class Backtester:
             allocation_log=(
                 pd.DataFrame(alloc_log_rows) if alloc_log_rows else None
             ),
+        )
+
+    # ── Multi-exchange bar loop ───────────────────────────────────────────
+
+    def _run_loop_multi_exchange(
+        self,
+        strategy: Strategy,
+        universes: dict[str, Universe],
+        timeframe: str | None = None,
+    ) -> BacktestResult:
+        """
+        Per-bar backtest across multiple exchanges simultaneously.
+
+        Each exchange has its own position book, equity account, and cost model.
+        The strategy receives a unified StrategyContext with data from all
+        exchanges and returns a PortfolioTarget whose exchange_allocations routes
+        each allocation to the correct exchange.
+
+        The aggregate equity curve is the sum of all per-exchange curves.
+        """
+        t0 = time.perf_counter()
+        exchange_names = list(universes.keys())
+        n_exchanges = len(exchange_names)
+
+        # ── Bar index: intersection of all exchange indices ───────────────
+        common_index: pd.Index | None = None
+        for uni in universes.values():
+            idx = uni.common_index() if len(uni.symbols) > 1 else uni.ohlcv(uni.symbols[0]).index
+            common_index = idx if common_index is None else common_index.intersection(idx)
+        if common_index is None or len(common_index) == 0:
+            raise ValueError("No common bars across universes")
+        index = common_index
+        n_bars = len(index)
+
+        # ── Capital split ─────────────────────────────────────────────────
+        if self._capital_by_exchange:
+            equity_by_exchange: dict[str, float] = dict(self._capital_by_exchange)
+        else:
+            per_ex = self.config.initial_capital / n_exchanges
+            equity_by_exchange = {ex: per_ex for ex in exchange_names}
+
+        # ── Per-exchange component dicts ──────────────────────────────────
+        # states[exchange][symbol], sizers[exchange][symbol], cost_models[exchange][symbol]
+        ex_states:       dict[str, dict[str, _AssetState]] = {}
+        ex_sizers:       dict[str, dict[str, Sizer]]       = {}
+        ex_cost_models:  dict[str, dict[str, CostModel]]   = {}
+
+        for ex in exchange_names:
+            uni = universes[ex]
+            syms = uni.symbols
+            ex_states[ex]      = {}
+            ex_sizers[ex]      = {}
+            ex_cost_models[ex] = {}
+            # Per-exchange cost default; falls back to global cost_model spec
+            ex_cost_spec = self._exchange_costs.get(ex, self._cost_model_spec)
+            for sym in syms:
+                ex_states[ex][sym] = _AssetState(
+                    stop_loss=self._resolve(self._stop_loss_spec, sym, default_stop_loss),
+                )
+                ex_sizers[ex][sym]      = self._resolve(self._sizer_spec, sym, default_sizer)
+                ex_cost_models[ex][sym] = self._resolve(ex_cost_spec, sym, NullCostModel)
+
+        # ── Strategy setup ────────────────────────────────────────────────
+        strategy.setup(universes)
+
+        # ── Pre-extract OHLCV arrays per exchange per symbol ──────────────
+        ohlcv_dfs: dict[str, dict[str, pd.DataFrame]] = {
+            ex: {sym: universes[ex].ohlcv(sym) for sym in universes[ex].symbols}
+            for ex in exchange_names
+        }
+
+        ex_local_idx:   dict[str, dict[str, np.ndarray]] = {}
+        ex_has_bar:     dict[str, dict[str, np.ndarray]] = {}
+        ex_closes:      dict[str, dict[str, np.ndarray]] = {}
+        ex_opens:       dict[str, dict[str, np.ndarray]] = {}
+        ex_highs:       dict[str, dict[str, np.ndarray]] = {}
+        ex_lows:        dict[str, dict[str, np.ndarray]] = {}
+        ex_col_arrays:  dict[str, dict[str, dict[str, np.ndarray]]] = {}
+
+        for ex in exchange_names:
+            ex_local_idx[ex]  = {}
+            ex_has_bar[ex]    = {}
+            ex_closes[ex]     = {}
+            ex_opens[ex]      = {}
+            ex_highs[ex]      = {}
+            ex_lows[ex]       = {}
+            ex_col_arrays[ex] = {}
+            for sym, df in ohlcv_dfs[ex].items():
+                locs  = df.index.get_indexer(index)
+                valid = locs >= 0
+                vi    = np.where(valid)[0]
+                vl    = locs[vi]
+
+                ex_local_idx[ex][sym] = locs
+                ex_has_bar[ex][sym]   = valid
+
+                def _mk(col: str, _df=df, _vi=vi, _vl=vl) -> np.ndarray:
+                    a = np.full(n_bars, np.nan)
+                    a[_vi] = _df[col].values[_vl]
+                    return a
+
+                ex_closes[ex][sym] = _mk("close")
+                ex_opens[ex][sym]  = _mk("open")
+                ex_highs[ex][sym]  = _mk("high")
+                ex_lows[ex][sym]   = _mk("low")
+
+                col_dict: dict[str, np.ndarray] = {}
+                for col in df.columns:
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        col_dict[col] = _mk(col)
+                ex_col_arrays[ex][sym] = col_dict
+
+        # ── Output accumulators ───────────────────────────────────────────
+        ex_equity_arrs: dict[str, np.ndarray] = {
+            ex: np.full(n_bars, np.nan) for ex in exchange_names
+        }
+        all_trades:    list[Trade] = []
+        closed_trades: list[Trade] = []
+        pos_log_rows:  list[dict] = []
+        alloc_log_rows: list[dict] = []
+
+        # ── Bar loop ──────────────────────────────────────────────────────
+        for i in range(n_bars):
+            ts = index[i]
+
+            # Per-exchange prices / bar dicts
+            ex_prices:    dict[str, dict[str, float]] = {}
+            ex_bar_locs:  dict[str, dict[str, int]]   = {}
+            ex_bar_dicts: dict[str, dict[str, dict]]  = {}
+
+            for ex in exchange_names:
+                ex_prices[ex]    = {}
+                ex_bar_locs[ex]  = {}
+                ex_bar_dicts[ex] = {}
+                for sym in universes[ex].symbols:
+                    if not ex_has_bar[ex][sym][i]:
+                        continue
+                    loc = int(ex_local_idx[ex][sym][i])
+                    ex_prices[ex][sym]   = float(ex_closes[ex][sym][i])
+                    ex_bar_locs[ex][sym] = loc
+                    ex_bar_dicts[ex][sym] = {
+                        col: float(arr[i])
+                        for col, arr in ex_col_arrays[ex][sym].items()
+                    }
+                    funding_snap = universes[ex].funding_at(sym, loc)
+                    if funding_snap is not None:
+                        ex_bar_dicts[ex][sym]["funding_rate"] = funding_snap.rate
+                        ex_bar_dicts[ex][sym]["funding_rate_ann_bps"] = funding_snap.rate_annualized
+
+            # ── Mark-to-market ────────────────────────────────────────────
+            for ex in exchange_names:
+                for sym, st in ex_states[ex].items():
+                    pos = st.position
+                    if pos.side != Side.FLAT and pos.size > 0 and sym in ex_prices[ex]:
+                        direction = 1 if pos.side == Side.LONG else -1
+                        pos.unrealized_pnl = (
+                            (ex_prices[ex][sym] - pos.entry_price) * pos.size * direction
+                        )
+
+            # ── Stop-loss checks ──────────────────────────────────────────
+            for ex in exchange_names:
+                for sym, st in ex_states[ex].items():
+                    pos = st.position
+                    if pos.side == Side.FLAT or sym not in ex_prices[ex]:
+                        continue
+                    loc = ex_bar_locs[ex].get(sym)
+                    if loc is None:
+                        continue
+                    df      = ohlcv_dfs[ex][sym]
+                    l2_list = universes[ex].l2(sym)
+                    l2_snap = l2_list[loc] if l2_list and loc < len(l2_list) else None
+                    stop_ctx = StopContext(
+                        position=pos,
+                        bar_idx=loc,
+                        open=float(ex_opens[ex][sym][i]),
+                        high=float(ex_highs[ex][sym][i]),
+                        low=float(ex_lows[ex][sym][i]),
+                        close=ex_prices[ex][sym],
+                        data=df,
+                        l2=l2_snap,
+                        bar_data=ex_bar_dicts[ex].get(sym, {}),
+                    )
+                    st.stop_loss.update(stop_ctx)
+                    stop_result = st.stop_loss.check(stop_ctx)
+                    if not stop_result.triggered and isinstance(st.stop_loss, EmbeddedStop):
+                        stop_result = st.stop_loss.check_with_levels(stop_ctx)
+
+                    if stop_result.triggered:
+                        exit_p = stop_result.exit_price
+                        cost = ex_cost_models[ex][sym].compute(
+                            exit_p, pos.size, pos.side, self.config, l2_snap, ex_bar_dicts[ex].get(sym, {}),
+                        )
+                        raw_pnl = (
+                            (exit_p - pos.entry_price) * pos.size
+                            if pos.side == Side.LONG
+                            else (pos.entry_price - exit_p) * pos.size
+                        )
+                        entry_fee = st.open_trade.fees if st.open_trade else 0.0
+                        pnl = raw_pnl - cost - entry_fee
+                        equity_by_exchange[ex] += pnl
+
+                        if st.open_trade is not None:
+                            st.open_trade.exit_price     = exit_p
+                            st.open_trade.exit_timestamp = ts
+                            st.open_trade.pnl            = pnl
+                            st.open_trade.pnl_pct        = (
+                                pnl / (pos.entry_price * pos.size)
+                                if pos.entry_price * pos.size > 0 else 0
+                            )
+                            st.open_trade.fees          += cost
+                            st.open_trade.reason_exit    = stop_result.reason
+                            st.open_trade.meta.update(stop_result.meta)
+                            st.open_trade.meta["exchange"] = ex
+                            closed_trades.append(st.open_trade)
+
+                        st.position   = Position()
+                        st.open_trade = None
+                        st.stop_loss.reset()
+                        strategy.on_fill(sym, pos.side, pos.size, exit_p, exchange=ex)
+
+            # ── Build unified context and generate targets ─────────────────
+            all_positions_ctx: dict[str, dict[str, Position]] = {
+                ex: {sym: ex_states[ex][sym].position for sym in universes[ex].symbols}
+                for ex in exchange_names
+            }
+            total_equity = sum(equity_by_exchange.values())
+            ctx = StrategyContext(
+                universes=universes,
+                bar_idx=i,
+                timestamp=ts,
+                equity_by_exchange=dict(equity_by_exchange),
+                all_positions=all_positions_ctx,
+                trade_history=closed_trades,
+            )
+            target: PortfolioTarget = strategy.generate(ctx)
+
+            # Log allocations
+            row: dict = {"timestamp": ts}
+            for ex in exchange_names:
+                for sym in universes[ex].symbols:
+                    alloc = target[(ex, sym)] if target.is_multi_exchange else target[sym]
+                    row[f"{ex}:{sym}_side"]       = alloc.side.name
+                    row[f"{ex}:{sym}_weight"]     = alloc.weight
+                    row[f"{ex}:{sym}_confidence"] = alloc.confidence
+            alloc_log_rows.append(row)
+
+            # ── Close / open per exchange ─────────────────────────────────
+            for ex in exchange_names:
+                for sym in universes[ex].symbols:
+                    alloc = (
+                        target[(ex, sym)] if target.is_multi_exchange
+                        else target[sym]
+                    )
+                    st    = ex_states[ex][sym]
+                    pos   = st.position
+                    price = ex_prices[ex].get(sym)
+
+                    # Close positions that should be flat or flip
+                    if pos.side != Side.FLAT and price is not None:
+                        if alloc.side == Side.FLAT or alloc.side != pos.side:
+                            cost = ex_cost_models[ex][sym].compute(
+                                price, pos.size, pos.side, self.config,
+                                None, ex_bar_dicts[ex].get(sym, {}),
+                            )
+                            entry_fee = st.open_trade.fees if st.open_trade else 0.0
+                            pnl = pos.unrealized_pnl - cost - entry_fee
+                            pnl_pct = (
+                                pnl / (pos.entry_price * pos.size)
+                                if pos.entry_price * pos.size > 0 else 0
+                            )
+                            trade = Trade(
+                                timestamp=pos.entry_timestamp,
+                                side=pos.side,
+                                size=pos.size,
+                                entry_price=pos.entry_price,
+                                exit_price=price,
+                                exit_timestamp=ts,
+                                pnl=pnl,
+                                pnl_pct=pnl_pct,
+                                fees=entry_fee + cost,
+                                confidence=(st.open_trade.confidence if st.open_trade else 0.0),
+                                reason_entry=(st.open_trade.reason_entry if st.open_trade else ""),
+                                reason_exit=alloc.reason or "target_flat",
+                                bar_values=(st.open_trade.bar_values if st.open_trade else {}),
+                                meta={"symbol": sym, "exchange": ex},
+                            )
+                            all_trades.append(trade)
+                            closed_trades.append(trade)
+                            equity_by_exchange[ex] += pnl
+                            st.position   = Position()
+                            st.open_trade = None
+                            st.stop_loss.reset()
+                            strategy.on_fill(sym, pos.side, pos.size, price, exchange=ex)
+
+                    # Open new positions
+                    st  = ex_states[ex][sym]
+                    pos = st.position
+                    if (
+                        pos.side == Side.FLAT
+                        and alloc.side != Side.FLAT
+                        and alloc.weight > 0
+                        and price is not None
+                    ):
+                        loc = ex_bar_locs[ex].get(sym, 0)
+                        df  = ohlcv_dfs[ex][sym]
+                        l2_list = universes[ex].l2(sym)
+                        l2_snap = l2_list[loc] if l2_list and loc < len(l2_list) else None
+
+                        sizing_ctx = SizingContext(
+                            equity=equity_by_exchange[ex],
+                            price=price,
+                            allocation=alloc,
+                            config=self.config,
+                            position=pos,
+                            data=df,
+                            bar_idx=loc,
+                            trade_history=closed_trades,
+                            l2=l2_snap,
+                            bar_data=ex_bar_dicts[ex].get(sym, {}),
+                        )
+                        size = ex_sizers[ex][sym].compute(sizing_ctx)
+
+                        max_notional = equity_by_exchange[ex] * alloc.weight * self.config.leverage
+                        max_size = max_notional / price if price > 0 else 0
+                        size = min(size, max_size)
+                        if size <= 0:
+                            continue
+
+                        cost = ex_cost_models[ex][sym].compute(
+                            price, size, alloc.side, self.config,
+                            l2_snap, ex_bar_dicts[ex].get(sym, {}),
+                        )
+
+                        st.position = Position(
+                            side=alloc.side,
+                            size=size,
+                            entry_price=price,
+                            entry_timestamp=ts,
+                        )
+
+                        o_i = float(ex_opens[ex][sym][i])
+                        h_i = float(ex_highs[ex][sym][i])
+                        l_i = float(ex_lows[ex][sym][i])
+                        stop_ctx = StopContext(
+                            position=st.position,
+                            bar_idx=loc,
+                            open=o_i  if not np.isnan(o_i)  else price,
+                            high=h_i  if not np.isnan(h_i)  else price,
+                            low=l_i   if not np.isnan(l_i)  else price,
+                            close=price,
+                            data=df,
+                            l2=l2_snap,
+                            bar_data=ex_bar_dicts[ex].get(sym, {}),
+                        )
+                        st.stop_loss.on_entry(st.position, stop_ctx)
+                        if isinstance(st.stop_loss, EmbeddedStop):
+                            st.stop_loss.set_levels(alloc.stop_loss, alloc.take_profit)
+
+                        trade = Trade(
+                            timestamp=ts,
+                            side=alloc.side,
+                            size=size,
+                            entry_price=price,
+                            fees=cost,
+                            confidence=alloc.confidence,
+                            reason_entry=alloc.reason,
+                            bar_values=alloc.meta,
+                            meta={"symbol": sym, "exchange": ex},
+                        )
+                        all_trades.append(trade)
+                        st.open_trade = trade
+                        strategy.on_fill(sym, alloc.side, size, price, exchange=ex)
+
+            # ── Record equity ──────────────────────────────────────────────
+            for ex in exchange_names:
+                unrealized_ex = sum(
+                    st.position.unrealized_pnl
+                    for st in ex_states[ex].values()
+                    if st.position.side != Side.FLAT
+                )
+                ex_equity_arrs[ex][i] = equity_by_exchange[ex] + unrealized_ex
+
+            # Position log
+            row_p: dict = {"timestamp": ts}
+            for ex in exchange_names:
+                for sym, st in ex_states[ex].items():
+                    row_p[f"{ex}:{sym}_side"] = st.position.side.value
+                    row_p[f"{ex}:{sym}_size"] = st.position.size
+            pos_log_rows.append(row_p)
+
+        # ── Force-close remaining positions ───────────────────────────────
+        last_ts = index[-1]
+        for ex in exchange_names:
+            for sym, st in ex_states[ex].items():
+                pos = st.position
+                if pos.side == Side.FLAT:
+                    continue
+                last_close = float(ex_closes[ex][sym][-1])
+                if np.isnan(last_close):
+                    last_close = float(ohlcv_dfs[ex][sym]["close"].iloc[-1])
+
+                cost = ex_cost_models[ex][sym].compute(
+                    last_close, pos.size, pos.side, self.config, None, None,
+                )
+                raw_pnl = (
+                    (last_close - pos.entry_price) * pos.size
+                    if pos.side == Side.LONG
+                    else (pos.entry_price - last_close) * pos.size
+                )
+                entry_fee = st.open_trade.fees if st.open_trade else 0.0
+                pnl = raw_pnl - cost - entry_fee
+                equity_by_exchange[ex] += pnl
+
+                if st.open_trade is not None:
+                    st.open_trade.exit_price     = last_close
+                    st.open_trade.exit_timestamp = last_ts
+                    st.open_trade.pnl            = pnl
+                    st.open_trade.pnl_pct        = (
+                        pnl / (pos.entry_price * pos.size)
+                        if pos.entry_price * pos.size > 0 else 0
+                    )
+                    st.open_trade.fees          += cost
+                    st.open_trade.reason_exit    = "End of data"
+                    st.open_trade.meta["exchange"] = ex
+                    closed_trades.append(st.open_trade)
+                else:
+                    trade = Trade(
+                        timestamp=pos.entry_timestamp,
+                        side=pos.side,
+                        size=pos.size,
+                        entry_price=pos.entry_price,
+                        exit_price=last_close,
+                        exit_timestamp=last_ts,
+                        pnl=pnl,
+                        pnl_pct=(
+                            pnl / (pos.entry_price * pos.size)
+                            if pos.entry_price * pos.size > 0 else 0
+                        ),
+                        fees=cost,
+                        reason_exit="End of data",
+                        meta={"symbol": sym, "exchange": ex},
+                    )
+                    all_trades.append(trade)
+                    closed_trades.append(trade)
+
+                ex_equity_arrs[ex][-1] = equity_by_exchange[ex]
+
+        # ── Assemble result ───────────────────────────────────────────────
+        # Total equity = sum across all exchanges
+        total_equity_arr = sum(ex_equity_arrs[ex] for ex in exchange_names)
+        eq_series = pd.Series(total_equity_arr, index=index, name="equity")
+
+        equity_curves_by_exchange = {
+            ex: pd.Series(ex_equity_arrs[ex], index=index, name=f"equity_{ex}")
+            for ex in exchange_names
+        }
+
+        final_trades = [t for t in all_trades if t.exit_price is not None]
+
+        # Aggregate symbols across all exchanges for meta
+        all_symbols: list[str] = []
+        for ex in exchange_names:
+            all_symbols.extend(universes[ex].symbols)
+
+        sym0 = exchange_names[0]
+        first_sym = universes[sym0].symbols[0] if universes[sym0].symbols else "ASSET"
+        meta: dict[str, Any] = {
+            "symbols":    all_symbols,
+            "exchanges":  exchange_names,
+            "vectorized": False,
+            "sizer":      type(ex_sizers[exchange_names[0]][first_sym]).__name__,
+            "stop_loss":  type(ex_states[exchange_names[0]][first_sym].stop_loss).__name__,
+            "cost_model": _cost_model_label(ex_cost_models[exchange_names[0]][first_sym]),
+        }
+        if timeframe is not None:
+            meta["timeframe"] = timeframe
+
+        pos_series = pd.Series(
+            np.zeros(n_bars, dtype=int), index=index, name="position"
+        )
+
+        return BacktestResult(
+            trades=final_trades,
+            equity_curve=eq_series,
+            positions=pos_series,
+            config=self.config,
+            run_time_s=time.perf_counter() - t0,
+            meta=meta,
+            positions_log=pd.DataFrame(pos_log_rows) if pos_log_rows else None,
+            allocation_log=pd.DataFrame(alloc_log_rows) if alloc_log_rows else None,
+            equity_curves_by_exchange=equity_curves_by_exchange,
         )

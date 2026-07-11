@@ -17,10 +17,12 @@ from testing.hypothesis import (
     TrainTestValidateSplit,
     report as hypothesis_report,
 )
+from strategy.base import Strategy, StrategyContext, PortfolioTarget
 from strategy.built_in import CompositeStrategy, SingleAssetStrategy
 from strategy.indicators import bollinger, ema, rsi
 from strategy.sizing import FixedNotionalSizer
 from strategy.stops import NopStopLoss
+from testing.backtester.costs import ExchangeFeeCost, FixedSlippageCost
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -280,6 +282,102 @@ class BuyAndHoldStrategy(SingleAssetStrategy):
         return Allocation(side=Side.LONG, weight=1.0, reason="buy and hold")
 
 
+class MultiExchangeMomentumStrategy(Strategy):
+    """
+    Two independent signals routed to two separate exchanges.
+
+    trend_exchange   — EMA trend-following (long-only): go long when close > EMA
+    reversal_exchange — Bollinger mean-reversion (long + short): fade extreme moves
+
+    Demonstrates multi-exchange Strategy usage:
+      • setup() receives a dict[exchange, Universe] and precomputes per-exchange indicators
+      • generate() returns PortfolioTarget.exchange_allocations keyed by (exchange, symbol)
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        trend_exchange: str,
+        reversal_exchange: str,
+        ema_slow: int = 200,
+        bb_window: int = 20,
+        bb_std: float = 2.0,
+        **kw,
+    ):
+        super().__init__(**kw)
+        self.symbol = symbol
+        self.trend_exchange = trend_exchange
+        self.reversal_exchange = reversal_exchange
+        self.ema_slow = ema_slow
+        self.bb_window = bb_window
+        self.bb_std = bb_std
+        self._ind: dict[str, pd.DataFrame] = {}
+
+    @property
+    def params(self) -> dict:
+        return {"ema_slow": self.ema_slow, "bb_window": self.bb_window, "bb_std": self.bb_std}
+
+    def setup(self, universes):
+        if isinstance(universes, Universe):
+            universes = {self.trend_exchange: universes}
+        self._ind = {}
+        for ex, uni in universes.items():
+            if self.symbol not in uni.symbols:
+                continue
+            df = uni.ohlcv(self.symbol).copy()
+            df["ema_slow"] = ema(df["close"], self.ema_slow)
+            df["bb_mid"], df["bb_upper"], df["bb_lower"] = bollinger(
+                df["close"], self.bb_window, self.bb_std
+            )
+            self._ind[ex] = df
+
+    def generate(self, ctx: StrategyContext) -> PortfolioTarget:
+        target = PortfolioTarget(timestamp=ctx.timestamp)
+        i = ctx.bar_idx
+        if i < max(self.ema_slow, self.bb_window):
+            return target
+
+        # Trend exchange — EMA trend-following (long-only)
+        df = self._ind.get(self.trend_exchange)
+        if df is not None and i < len(df):
+            close   = df["close"].iat[i]
+            ema_val = df["ema_slow"].iat[i]
+            if not (pd.isna(close) or pd.isna(ema_val)):
+                if close > ema_val:
+                    target[(self.trend_exchange, self.symbol)] = Allocation(
+                        side=Side.LONG, weight=1.0, confidence=1.0,
+                        reason=f"above EMA{self.ema_slow}",
+                    )
+                else:
+                    target[(self.trend_exchange, self.symbol)] = Allocation(
+                        side=Side.FLAT, reason="below EMA",
+                    )
+
+        # Reversal exchange — Bollinger mean-reversion (long + short)
+        df = self._ind.get(self.reversal_exchange)
+        if df is not None and i < len(df):
+            close    = df["close"].iat[i]
+            bb_upper = df["bb_upper"].iat[i]
+            bb_lower = df["bb_lower"].iat[i]
+            if not (pd.isna(close) or pd.isna(bb_upper)):
+                if close < bb_lower:
+                    target[(self.reversal_exchange, self.symbol)] = Allocation(
+                        side=Side.LONG, weight=1.0, confidence=1.0,
+                        reason=f"BB oversold | lower={bb_lower:.2f}",
+                    )
+                elif close > bb_upper:
+                    target[(self.reversal_exchange, self.symbol)] = Allocation(
+                        side=Side.SHORT, weight=1.0, confidence=1.0,
+                        reason=f"BB overbought | upper={bb_upper:.2f}",
+                    )
+                else:
+                    target[(self.reversal_exchange, self.symbol)] = Allocation(
+                        side=Side.FLAT, reason="BB neutral",
+                    )
+
+        return target
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Demo runner
 # ═══════════════════════════════════════════════════════════════════════════
@@ -304,6 +402,82 @@ def _print_metrics_table(summaries: list[tuple[str, dict]]) -> None:
     for label, key in _METRICS:
         row = "".join(f"{s[key]:>12}" for _, s in summaries)
         print(f"{label:<{col}} {row}")
+
+
+def _demo_multi_exchange(symbol: str, data: pd.DataFrame, timeframe: str) -> None:
+    """
+    Multi-exchange backtest section.
+
+    Two virtual exchanges are created from the same OHLCV data:
+      'nyse'  — low-cost venue, EMA trend-following (2 bps maker / 3 bps taker + 1 bps slip)
+      'bats'  — higher-cost venue, Bollinger mean-reversion (10 bps maker / 15 bps taker + 5 bps slip)
+
+    Capital is split $50k / $50k across the two exchanges.
+    """
+    print("\n\n" + "═" * 70)
+    print("  MULTI-EXCHANGE DEMO")
+    print("  'nyse': EMA trend-following (long-only, low-cost)")
+    print("  'bats': Bollinger mean-reversion (long+short, higher-cost)")
+    print("═" * 70)
+
+    u_nyse = Universe(symbols=[symbol])
+    u_nyse.add_asset(symbol, data)
+
+    u_bats = Universe(symbols=[symbol])
+    u_bats.add_asset(symbol, data)
+
+    strategy = MultiExchangeMomentumStrategy(
+        symbol=symbol,
+        trend_exchange="nyse",
+        reversal_exchange="bats",
+    )
+
+    nyse_cost = CompositeCostModel([
+        ExchangeFeeCost(maker_bps=2, taker_bps=3),
+        FixedSlippageCost(slippage_bps=1),
+    ])
+    bats_cost = CompositeCostModel([
+        ExchangeFeeCost(maker_bps=10, taker_bps=15),
+        FixedSlippageCost(slippage_bps=5),
+    ])
+
+    config = BacktestConfig(initial_capital=100_000.0, max_position_pct=1.0, leverage=1.0)
+    sizer  = FixedNotionalSizer(notional=50_000)
+
+    bt = Backtester(
+        strategy=strategy,
+        config=config,
+        sizer=sizer,
+        stop_loss=NopStopLoss(),
+        exchange_costs={"nyse": nyse_cost, "bats": bats_cost},
+        capital_by_exchange={"nyse": 50_000.0, "bats": 50_000.0},
+    )
+    result = bt.run(
+        universes={"nyse": u_nyse, "bats": u_bats},
+        timeframe=timeframe,
+    )
+
+    s = result.summary()
+    print(f"\nCombined result  ({s['num_trades']} trades  |  run in {s['run_time_s']:.2f}s)")
+    for label, key in _METRICS:
+        print(f"  {label:<24} {s[key]:>10}")
+
+    if result.equity_curves_by_exchange:
+        print("\nPer-exchange breakdown:")
+        print(f"  {'Exchange':<16} {'Start $':>12} {'End $':>12} {'Return %':>10} {'Trades':>8} {'Fees':>10}")
+        print("  " + "-" * 70)
+        for ex, curve in result.equity_curves_by_exchange.items():
+            ex_trades = [t for t in result.trades if t.meta.get("exchange") == ex]
+            total_fees = sum(t.fees for t in ex_trades)
+            ret_pct = (curve.iloc[-1] / curve.iloc[0] - 1) * 100
+            print(
+                f"  {ex:<16} {curve.iloc[0]:>12,.0f} {curve.iloc[-1]:>12,.0f}"
+                f" {ret_pct:>9.2f}% {len(ex_trades):>8} {total_fees:>10,.2f}"
+            )
+
+    run_dir = result.save("multi_exchange_demo")
+    print(f"\n  Results saved to: {run_dir}")
+    print(f"  Files: log.json  trades.csv  equity_curve.png  equity_curves_by_exchange.csv")
 
 
 def demo(
@@ -535,6 +709,9 @@ def demo(
         df  = sr.summary.sort_values("regime")[stress_cols].reset_index(drop=True)
         print(f"\n  {regime_label} regimes:")
         print(df.to_string(index=False))
+
+
+    _demo_multi_exchange(symbol, data, timeframe)
 
 
 if __name__ == "__main__":

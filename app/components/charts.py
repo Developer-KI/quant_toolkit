@@ -67,11 +67,11 @@ def bollinger_traces(mid: pd.Series, upper: pd.Series, lower: pd.Series) -> list
     return [
         go.Scatter(x=upper.index, y=upper.values, name="BB Upper",
                    line=dict(color=_ORANGE, width=1, dash="dot"), showlegend=True),
-        go.Scatter(x=mid.index, y=mid.values, name="BB Mid",
-                   line=dict(color=_ORANGE, width=1), showlegend=True),
         go.Scatter(x=lower.index, y=lower.values, name="BB Lower",
                    line=dict(color=_ORANGE, width=1, dash="dot"),
                    fill="tonexty", fillcolor="rgba(255,152,0,0.05)", showlegend=True),
+        go.Scatter(x=mid.index, y=mid.values, name="BB Mid",
+                   line=dict(color=_ORANGE, width=1), showlegend=True),
     ]
 
 
@@ -209,9 +209,9 @@ def trade_markers(fig: go.Figure, trades_df: pd.DataFrame) -> go.Figure:
     pnl_pct_series = exits["pnl_pct"] if "pnl_pct" in exits.columns else pd.Series([0.0] * len(exits), index=exits.index)
     exit_ts = exits["exit_timestamp"] if "exit_timestamp" in exits.columns else exits[ts_col]
 
-    for label, color, mask in [
-        ("Exit WIN", _GREEN, pnl_series > 0),
-        ("Exit LOSS", _RED, pnl_series <= 0),
+    for label, color, sym, mask in [
+        ("Exit WIN",  _GREEN, "star", pnl_series > 0),
+        ("Exit LOSS", _RED,   "x",   pnl_series <= 0),
     ]:
         grp = exits[mask]
         if grp.empty:
@@ -225,7 +225,7 @@ def trade_markers(fig: go.Figure, trades_df: pd.DataFrame) -> go.Figure:
             x=exit_ts[mask], y=grp[xp_col],
             mode="markers", name=label,
             legendgroup="Exits",
-            marker=dict(color=color, size=10, symbol="x-thin", line=dict(color="white", width=1.5)),
+            marker=dict(color=color, size=11, symbol=sym, line=dict(color="white", width=1.2)),
             customdata=custom,
             hovertemplate=(
                 f"<b>{label}</b><br>"
