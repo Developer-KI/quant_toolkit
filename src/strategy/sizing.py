@@ -77,12 +77,15 @@ class Sizer(abc.ABC):
         prices: np.ndarray,
         weights: np.ndarray,
         config: BacktestConfig,
+        running_equity: np.ndarray | None = None,
     ) -> np.ndarray:
         """
-        Compute position sizes for an array of entry bars without equity state.
+        Compute position sizes for an array of entry bars.
+        ``running_equity``, when provided, is the per-trade equity at entry —
+        sizers should prefer it over ``config.initial_capital`` when available.
         Only called when ``vectorizable`` is True.
         """
-        del prices, weights, config
+        del prices, weights, config, running_equity
         raise NotImplementedError(f"{type(self).__name__} is not vectorizable")
 
     def __repr__(self):
@@ -147,8 +150,14 @@ class FixedNotionalSizer(Sizer):
         prices: np.ndarray,
         weights: np.ndarray,
         config: BacktestConfig,
+        running_equity: np.ndarray | None = None,
     ) -> np.ndarray:
-        base = self.notional if self.notional is not None else config.initial_capital * self.equity_pct
+        if self.notional is not None:
+            base = self.notional
+        elif running_equity is not None:
+            base = running_equity * self.equity_pct
+        else:
+            base = config.initial_capital * self.equity_pct
         notional = base * weights * config.leverage
         return np.where(prices > 0, notional / prices, 0.0)
 
@@ -177,7 +186,7 @@ class VolatilityTargetSizer(Sizer):
 
     def compute(self, ctx: SizingContext) -> float:
         if ctx.data is None or ctx.bar_idx < self.lookback:
-            return ctx.equity * 0.01 * ctx.config.leverage / ctx.price
+            return ctx.equity * self.target_vol * ctx.config.leverage / ctx.price
 
         closes = ctx.data["close"].iloc[
             max(0, ctx.bar_idx - self.lookback) : ctx.bar_idx + 1
@@ -292,14 +301,19 @@ class AntiMartingaleSizer(Sizer):
         trades = ctx.trade_history or []
 
         streak = 0
-        is_winning = True
-        for t in reversed(trades):
-            if is_winning and t.pnl > 0:
-                streak += 1
-            elif not is_winning and t.pnl <= 0:
-                streak -= 1
-            else:
-                break
+        if trades:
+            last_pnl = trades[-1].pnl
+            if last_pnl != 0.0:
+                is_winning = last_pnl > 0
+                for t in reversed(trades):
+                    if t.pnl == 0.0:
+                        break  # breakeven trade ends any streak
+                    if is_winning and t.pnl > 0:
+                        streak += 1
+                    elif not is_winning and t.pnl < 0:
+                        streak -= 1
+                    else:
+                        break
 
         if streak > 0:
             mult = 1.0 + self.streak_multiplier * streak
