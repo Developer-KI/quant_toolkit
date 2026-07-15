@@ -2,9 +2,7 @@
 
 ## About
 
-A modular, multi-asset, multi-exchange Python framework for developing, backtesting, stress-testing, and live-trading quantitative strategies on crypto perpetual futures, US equities, and spot. Built with Hyperliquid, Binance Futures, and Alpaca support out of the box, and extensible to any exchange via structural protocols.
-
-My focus is on **doing things right**: clean dependency graphs, protocol-driven interfaces, statistically sound backtest methodology, and code that is easy to extend without being over-engineered.
+A modular, multi-asset, multi-exchange Python framework for developing, backtesting, stress-testing, and live-trading quantitative strategies. My focus is on **doing things right**. Clean dependency graphs, protocol-driven interfaces, statistically sound backtest methodology, and code that is easy to extend without being over-engineered.
 
 **Contact:** [ivanov.r.kiril@abv.bg](mailto:ivanov.r.kiril@abv.bg)
 
